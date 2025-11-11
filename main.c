@@ -143,12 +143,42 @@ static void credentialHandler(struct shared_ptr *credReqHandler,
             credReqHandler->obj)),
         need2FA ? "true" : "false");
 
-    int passLen = strlen(amPassword);
+    size_t passLen = amPassword ? strlen(amPassword) : 0;
 
     if (need2FA) {
-        printf("2FA code: ");
-        fflush(stdout);
-        scanf("%6s", amPassword + passLen);
+        char code_buf[16] = {0};
+        FILE *in = stdin;
+        if (!in || !isatty(fileno(in))) {
+            in = fopen("/dev/tty", "r");
+        }
+        fprintf(stderr, "2FA code: ");
+        fflush(stderr);
+        if (in && fgets(code_buf, sizeof(code_buf), in) != NULL) {
+            size_t n = strcspn(code_buf, "\r\n");
+            code_buf[n] = '\0';
+            if (strlen(code_buf) > 6) {
+                code_buf[6] = '\0';
+            }
+            size_t codeLen = strlen(code_buf);
+            if (codeLen == 0) {
+                fprintf(stderr, "[!] Empty 2FA code.\n");
+                exit(EXIT_FAILURE);
+            }
+            char *combined = (char *)malloc(passLen + codeLen + 1);
+            if (!combined) {
+                perror("malloc");
+                exit(EXIT_FAILURE);
+            }
+            if (amPassword && passLen > 0) memcpy(combined, amPassword, passLen);
+            memcpy(combined + passLen, code_buf, codeLen);
+            combined[passLen + codeLen] = '\0';
+            amPassword = combined;
+            if (in != stdin) fclose(in);
+        } else {
+            fprintf(stderr, "[!] Failed to read 2FA code from input.\n");
+            if (in && in != stdin) fclose(in);
+            exit(EXIT_FAILURE);
+        }
     }
 
     uint8_t *const ptr = malloc(80);
