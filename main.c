@@ -11,13 +11,59 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/time.h>
 
 #include "import.h"
 #include "cmdline.h"
 #include "cjson/cjson.h"
-#ifndef MyRelease
-#include "subhook/subhook.c"
+
+// Portable compatibility for non-Linux platforms
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
 #endif
+
+static inline int is_transient_accept_errno(int e) {
+#ifdef ENETDOWN
+    if (e == ENETDOWN) return 1;
+#endif
+#ifdef EPROTO
+    if (e == EPROTO) return 1;
+#endif
+#ifdef ENOPROTOOPT
+    if (e == ENOPROTOOPT) return 1;
+#endif
+#ifdef EHOSTDOWN
+    if (e == EHOSTDOWN) return 1;
+#endif
+#ifdef ENONET
+    if (e == ENONET) return 1;
+#endif
+#ifdef EHOSTUNREACH
+    if (e == EHOSTUNREACH) return 1;
+#endif
+#ifdef EOPNOTSUPP
+    if (e == EOPNOTSUPP) return 1;
+#endif
+#ifdef ENETUNREACH
+    if (e == ENETUNREACH) return 1;
+#endif
+    return 0;
+}
+
+static int accept4_compat(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
+#if defined(__linux__)
+    return accept4(fd, addr, addrlen, flags);
+#else
+    int cfd = accept(fd, addr, addrlen);
+    if (cfd >= 0 && (flags & SOCK_CLOEXEC)) {
+#ifdef FD_CLOEXEC
+        (void)fcntl(cfd, F_SETFD, FD_CLOEXEC);
+#endif
+    }
+    return cfd;
+#endif
+}
 
 static struct shared_ptr apInf;
 static uint8_t leaseMgr[16];
@@ -100,33 +146,9 @@ static void credentialHandler(struct shared_ptr *credReqHandler,
     int passLen = strlen(amPassword);
 
     if (need2FA) {
-        if (args_info.code_from_file_flag) {
-            fprintf(stderr, "[!] Enter your 2FA code into rootfs/%s/2fa.txt\n", args_info.base_dir_arg);
-            fprintf(stderr, "[!] Example command: echo -n 114514 > rootfs/%s/2fa.txt\n", args_info.base_dir_arg);
-            fprintf(stderr, "[!] Waiting for input...\n");
-            int count = 0;
-            while (1)
-            {
-                if (count >= 20) {
-                    fprintf(stderr, "[!] Failed to get 2FA Code in 60s. Exiting...\n");
-                    exit(0);
-                }
-                char *path = strcat_b(args_info.base_dir_arg, "/2fa.txt");
-                if (file_exists(path)) {
-                    FILE *fp = fopen(path, "r");
-                    fscanf(fp, "%6s", amPassword + passLen);
-                    remove(path);
-                    fprintf(stderr, "[!] Code file detected! Logging in...\n");
-                    break;
-                } else {
-                    sleep(3);
-                    count++;
-                }
-            }
-        } else {
-            printf("2FA code: ");
-            scanf("%6s", amPassword + passLen);
-        }
+        printf("2FA code: ");
+        fflush(stdout);
+        scanf("%6s", amPassword + passLen);
     }
 
     uint8_t *const ptr = malloc(80);
@@ -169,11 +191,7 @@ static inline void init() {
 
     static const char *resolvers[2] = {"223.5.5.5", "223.6.6.6"};
     _resolv_set_nameservers_for_net(0, resolvers, 2, ".");
-#ifndef MyRelease
-    subhook_install(subhook_new(
-        _ZN13mediaplatform26DebugLogEnabledForPriorityENS_11LogPriorityE,
-        allDebug, SUBHOOK_64BIT_OFFSET));
-#endif
+    // Debug hook disabled on this platform; proceeding without subhook.
 
     // static char android_id[16];
     // for (int i = 0; i < 16; ++i) {
@@ -278,12 +296,19 @@ static inline void writefull(const int connfd, void *const buf,
 
 static void *FHinstance = NULL;
 static void *preshareCtx = NULL;
+static pthread_mutex_t preshare_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 inline static void *getKdContext(const char *const adam,
                                  const char *const uri) {
     uint8_t isPreshare = (strcmp("0", adam) == 0);
-    if (isPreshare && preshareCtx != NULL) {
-        return preshareCtx;
+    if (isPreshare) {
+        pthread_mutex_lock(&preshare_mutex);
+        if (preshareCtx != NULL) {
+            void *cached = preshareCtx;
+            pthread_mutex_unlock(&preshare_mutex);
+            return cached;
+        }
+        pthread_mutex_unlock(&preshare_mutex);
     }
     fprintf(stderr, "[.] adamId: %s, uri: %s\n", adam, uri);
 
@@ -314,8 +339,11 @@ inline static void *getKdContext(const char *const adam,
 
     void *kdContext =
         *_ZNK18SVFootHillPContext9kdContextEv(SVFootHillPContext.obj);
-    if (kdContext != NULL && isPreshare)
+    if (kdContext != NULL && isPreshare) {
+        pthread_mutex_lock(&preshare_mutex);
         preshareCtx = kdContext;
+        pthread_mutex_unlock(&preshare_mutex);
+    }
     return kdContext;
 }
 
@@ -374,6 +402,34 @@ void handle(const int connfd) {
 }
 
 extern uint8_t handle_cpp(int);
+void handle_m3u8(const int connfd);
+
+typedef struct { int fd; } decrypt_conn_args;
+static void *decrypt_conn(void *arg) {
+    decrypt_conn_args *a = (decrypt_conn_args *)arg;
+    int cfd = a->fd;
+    free(a);
+    if (!handle_cpp(cfd)) {
+        uint8_t autom = 1;
+        _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+    }
+    if (close(cfd) == -1) {
+        perror("close");
+    }
+    return NULL;
+}
+
+typedef struct { int fd; } m3u8_conn_args;
+static void *m3u8_conn(void *arg) {
+    m3u8_conn_args *a = (m3u8_conn_args *)arg;
+    int cfd = a->fd;
+    free(a);
+    handle_m3u8(cfd);
+    if (close(cfd) == -1) {
+        perror("close");
+    }
+    return NULL;
+}
 
 inline static int new_socket() {
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
@@ -403,31 +459,36 @@ inline static int new_socket() {
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
     while (1) {
-        const int connfd = accept4(fd, (struct sockaddr *)&peer_addr,
+        const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
-            if (errno == ENETDOWN || errno == EPROTO || errno == ENOPROTOOPT ||
-                errno == EHOSTDOWN || errno == ENONET ||
-                errno == EHOSTUNREACH || errno == EOPNOTSUPP ||
-                errno == ENETUNREACH)
+            if (is_transient_accept_errno(errno))
                 continue;
-            perror("accept4");
+            perror("accept");
             return EXIT_FAILURE;
         }
 
-        if (!handle_cpp(connfd)) {
-            uint8_t autom = 1;
-            _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+        // spawn a detached thread per connection
+        pthread_t th;
+        decrypt_conn_args *args = (decrypt_conn_args *)malloc(sizeof(decrypt_conn_args));
+        if (args == NULL) {
+            perror("malloc");
+            close(connfd);
+            continue;
         }
-        // if (sigsetjmp(catcher.env, 0) == 0) {
-        //     catcher.do_jump = 1;
-        //     handle(connfd);
-        // }
-        // catcher.do_jump = 0;
-
-        if (close(connfd) == -1) {
-            perror("close");
-            return EXIT_FAILURE;
+        args->fd = connfd;
+        if (pthread_create(&th, NULL, decrypt_conn, (void *)args) == 0) {
+            pthread_detach(th);
+        } else {
+            perror("pthread_create");
+            // fallback: handle synchronously
+            if (!handle_cpp(connfd)) {
+                uint8_t autom = 1;
+                _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+            }
+            if (close(connfd) == -1) {
+                perror("close");
+            }
         }
     }
 }
@@ -537,22 +598,33 @@ static inline void *new_socket_m3u8(void *args) {
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
     while (1) {
-        const int connfd = accept4(fd, (struct sockaddr *)&peer_addr,
+        const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
-            if (errno == ENETDOWN || errno == EPROTO || errno == ENOPROTOOPT ||
-                errno == EHOSTDOWN || errno == ENONET ||
-                errno == EHOSTUNREACH || errno == EOPNOTSUPP ||
-                errno == ENETUNREACH)
+            if (is_transient_accept_errno(errno))
                 continue;
-            perror("accept4");
+            perror("accept");
             
         }
 
-        handle_m3u8(connfd);
-
-        if (close(connfd) == -1) {
-            perror("close");
+        // spawn a detached thread per m3u8 connection
+        pthread_t th;
+        m3u8_conn_args *args_m = (m3u8_conn_args *)malloc(sizeof(m3u8_conn_args));
+        if (args_m == NULL) {
+            perror("malloc");
+            close(connfd);
+            continue;
+        }
+        args_m->fd = connfd;
+        if (pthread_create(&th, NULL, m3u8_conn, (void *)args_m) == 0) {
+            pthread_detach(th);
+        } else {
+            perror("pthread_create");
+            // fallback: handle synchronously
+            handle_m3u8(connfd);
+            if (close(connfd) == -1) {
+                perror("close");
+            }
         }
     }
 }
