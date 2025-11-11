@@ -13,9 +13,9 @@ Available for x86_64 and arm64. Need to download prebuilt version from releases 
 
 Build image: `docker build --tag wrapper .`
 
-Login: `docker run -v ./rootfs/data:/app/rootfs/data -p 10020:10020 -e args="-L username:password -F -H 0.0.0.0" wrapper`
+Login: `docker run -v ./rootfs/data:/app/rootfs/data -p 10020:10020 -e args="-L username:password -F -H 0.0.0.0" -it wrapper`
 
-Run: `docker run -v ./rootfs/data:/app/rootfs/data -p 10020:10020 -e args="-H 0.0.0.0" wrapper`
+Run: `docker run -v ./rootfs/data:/app/rootfs/data -p 10020:10020 -e args="-H 0.0.0.0" -it rapper`
 
 # Usage
 ```
