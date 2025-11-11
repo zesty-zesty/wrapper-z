@@ -5,7 +5,8 @@ on:
     branches: [ "arm64" ]
   pull_request:
     branches: [ "arm64" ]
-
+  workflow_dispatch:
+  
 jobs:
   build:
 
