@@ -1,4 +1,4 @@
-name: Build for arm64
+name: Build arm64
 
 on:
   push:
@@ -42,7 +42,7 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Wrapper.arm64.${{ steps.vars.outputs.sha_short }}
+        name: Wrapper-z.arm64.${{ steps.vars.outputs.sha_short }}
         include-hidden-files: true
         path: |
           rootfs
@@ -50,12 +50,12 @@ jobs:
           Dockerfile
   
     - name: Create Release Zip File
-      run: zip -r Wrapper.arm64.${{ steps.vars.outputs.sha_short }}.zip rootfs/ wrapper Dockerfile
+      run: zip -r Wrapper-z.arm64.${{ steps.vars.outputs.sha_short }}.zip rootfs/ wrapper Dockerfile
       
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        files: Wrapper.arm64.${{ steps.vars.outputs.sha_short }}.zip
+        files: Wrapper-z.arm64.${{ steps.vars.outputs.sha_short }}.zip
         body: ${{ github.event.head_commit.message }}
         name: Wrapper.arm64.${{ steps.vars.outputs.sha_short }}
         tag_name: Wrapper.arm64.latest
