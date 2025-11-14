@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 
 #include <arpa/inet.h>
@@ -18,6 +19,8 @@
 #include "import.h"
 #include "cmdline.h"
 #include "cjson/cjson.h"
+#include "thread_pool.h"
+#include <netinet/tcp.h>
 // Portable compatibility for non-Linux platforms
 #ifndef SOCK_CLOEXEC
 #define SOCK_CLOEXEC 0
@@ -72,6 +75,11 @@ char *amUsername, *amPassword;
 struct shared_ptr GUID;
 int decryptCount = 1000;
 char *device_infos[9];
+static pthread_mutex_t lease_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t shutdown_flag = 0;
+static int listen_fd_dec = -1;
+static int listen_fd_m3u8 = -1;
+static thread_pool *g_pool = NULL;
 
 #ifndef MyRelease
 int32_t CURLOPT_SSL_VERIFYPEER = 64;
@@ -449,20 +457,31 @@ static inline void writefull(const int connfd, void *const buf,
 }
 
 static void *FHinstance = NULL;
-static void *preshareCtx = NULL;
+static _Atomic(void*) preshareCtx = NULL;
 static pthread_mutex_t preshare_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static inline void lease_refresh_automatically_wrapped(uint8_t *autom) {
+    pthread_mutex_lock(&lease_mutex);
+    _ZN22SVPlaybackLeaseManager25refreshLeaseAutomaticallyERKb(leaseMgr, autom);
+    pthread_mutex_unlock(&lease_mutex);
+}
+
+static inline void lease_request_wrapped(uint8_t *autom) {
+    pthread_mutex_lock(&lease_mutex);
+    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, autom);
+    pthread_mutex_unlock(&lease_mutex);
+}
+
+static void handle_sig(int sig) { (void)sig; shutdown_flag = 1; }
 
 inline static void *getKdContext(const char *const adam,
                                  const char *const uri) {
     uint8_t isPreshare = (strcmp("0", adam) == 0);
     if (isPreshare) {
-        pthread_mutex_lock(&preshare_mutex);
-        if (preshareCtx != NULL) {
-            void *cached = preshareCtx;
-            pthread_mutex_unlock(&preshare_mutex);
+        void *cached = atomic_load(&preshareCtx);
+        if (cached != NULL) {
             return cached;
         }
-        pthread_mutex_unlock(&preshare_mutex);
     }
     fprintf(stderr, "[.] adamId: %s, uri: %s\n", adam, uri);
 
@@ -495,7 +514,7 @@ inline static void *getKdContext(const char *const adam,
         *_ZNK18SVFootHillPContext9kdContextEv(SVFootHillPContext.obj);
     if (kdContext != NULL && isPreshare) {
         pthread_mutex_lock(&preshare_mutex);
-        preshareCtx = kdContext;
+        atomic_store(&preshareCtx, kdContext);
         pthread_mutex_unlock(&preshare_mutex);
     }
     return kdContext;
@@ -574,7 +593,7 @@ static void *decrypt_conn(void *arg) {
     free(a);
     if (!handle_cpp(cfd)) {
         uint8_t autom = 1;
-        _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+        lease_request_wrapped(&autom);
     }
     if (close(cfd) == -1) {
         perror("close");
@@ -594,24 +613,33 @@ static void *m3u8_conn(void *arg) {
     return NULL;
 }
 
+static inline void setup_conn_opts(int fd) {
+    struct timeval tv; tv.tv_sec = 30; tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static void job_decrypt(void *arg) { (void)decrypt_conn(arg); }
+static void job_m3u8(void *arg) { (void)m3u8_conn(arg); }
+
 inline static int new_socket() {
-    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
-    if (fd == -1) {
+    listen_fd_dec = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (listen_fd_dec == -1) {
         perror("socket");
         return EXIT_FAILURE;
     }
     const int optval = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    setsockopt(listen_fd_dec, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
     static struct sockaddr_in serv_addr = {.sin_family = AF_INET};
     inet_pton(AF_INET, args_info.host_arg, &serv_addr.sin_addr);
     serv_addr.sin_port = htons(args_info.decrypt_port_arg);
-    if (bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
+    if (bind(listen_fd_dec, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
         perror("bind");
         return EXIT_FAILURE;
     }
 
-    if (listen(fd, 5) == -1) {
+    if (listen(listen_fd_dec, 128) == -1) {
         perror("listen");
         return EXIT_FAILURE;
     }
@@ -621,8 +649,8 @@ inline static int new_socket() {
 
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
-    while (1) {
-        const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
+    while (!shutdown_flag) {
+        const int connfd = accept4_compat(listen_fd_dec, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
             if (is_transient_accept_errno(errno))
@@ -631,8 +659,7 @@ inline static int new_socket() {
             return EXIT_FAILURE;
         }
 
-        // spawn a detached thread per connection
-        pthread_t th;
+        setup_conn_opts(connfd);
         decrypt_conn_args *args = (decrypt_conn_args *)malloc(sizeof(decrypt_conn_args));
         if (args == NULL) {
             perror("malloc");
@@ -640,20 +667,18 @@ inline static int new_socket() {
             continue;
         }
         args->fd = connfd;
-        if (pthread_create(&th, NULL, decrypt_conn, (void *)args) == 0) {
-            pthread_detach(th);
-        } else {
-            perror("pthread_create");
-            // fallback: handle synchronously
+        if (!thread_pool_enqueue(g_pool, job_decrypt, (void *)args)) {
+            free(args);
             if (!handle_cpp(connfd)) {
                 uint8_t autom = 1;
-                _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+                lease_request_wrapped(&autom);
             }
             if (close(connfd) == -1) {
                 perror("close");
             }
         }
     }
+    return EXIT_SUCCESS;
 }
 
 
@@ -737,21 +762,22 @@ void handle_m3u8(const int connfd) {
 }
 
 static inline void *new_socket_m3u8(void *args) {
-    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
-    if (fd == -1) {
+    (void)args;
+    listen_fd_m3u8 = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (listen_fd_m3u8 == -1) {
         perror("socket");
     }
     const int optval = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    setsockopt(listen_fd_m3u8, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
     static struct sockaddr_in serv_addr = {.sin_family = AF_INET};
     inet_pton(AF_INET, args_info.host_arg, &serv_addr.sin_addr);
     serv_addr.sin_port = htons(args_info.m3u8_port_arg);
-    if (bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
+    if (bind(listen_fd_m3u8, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
         perror("bind");
     }
 
-    if (listen(fd, 5) == -1) {
+    if (listen(listen_fd_m3u8, 128) == -1) {
         perror("listen");
     }
 
@@ -760,18 +786,18 @@ static inline void *new_socket_m3u8(void *args) {
 
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
-    while (1) {
-        const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
+    while (!shutdown_flag) {
+        const int connfd = accept4_compat(listen_fd_m3u8, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
             if (is_transient_accept_errno(errno))
                 continue;
             perror("accept");
+            continue;
             
         }
 
-        // spawn a detached thread per m3u8 connection
-        pthread_t th;
+        setup_conn_opts(connfd);
         m3u8_conn_args *args_m = (m3u8_conn_args *)malloc(sizeof(m3u8_conn_args));
         if (args_m == NULL) {
             perror("malloc");
@@ -779,17 +805,15 @@ static inline void *new_socket_m3u8(void *args) {
             continue;
         }
         args_m->fd = connfd;
-        if (pthread_create(&th, NULL, m3u8_conn, (void *)args_m) == 0) {
-            pthread_detach(th);
-        } else {
-            perror("pthread_create");
-            // fallback: handle synchronously
+        if (!thread_pool_enqueue(g_pool, job_m3u8, (void *)args_m)) {
+            free(args_m);
             handle_m3u8(connfd);
             if (close(connfd) == -1) {
                 perror("close");
             }
         }
     }
+    return NULL;
 }
 
 char* get_account_storefront_id(struct shared_ptr reqCtx) {
@@ -969,16 +993,24 @@ int main(int argc, char *argv[]) {
     _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
         leaseMgr, &endLeaseCallback, &pbErrCallback);
     uint8_t autom = 1;
-    _ZN22SVPlaybackLeaseManager25refreshLeaseAutomaticallyERKb(leaseMgr, &autom);
-    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+    lease_refresh_automatically_wrapped(&autom);
+    lease_request_wrapped(&autom);
     FHinstance = _ZN21SVFootHillSessionCtrl8instanceEv();
 
     write_storefront_id(ctx);
     write_music_token(ctx);
 
+    struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = handle_sig; sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
+
+    int nthreads = 8; int maxq = 256;
+    g_pool = thread_pool_create(nthreads, maxq);
+
     pthread_t m3u8_thread;
     pthread_create(&m3u8_thread, NULL, &new_socket_m3u8, NULL);
-    pthread_detach(m3u8_thread);
 
-    return new_socket();
+    int rc = new_socket();
+    shutdown_flag = 1;
+    thread_pool_shutdown(g_pool);
+    pthread_join(m3u8_thread, NULL);
+    return rc;
 }

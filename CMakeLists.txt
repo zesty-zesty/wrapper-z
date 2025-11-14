@@ -3,7 +3,8 @@ cmake_minimum_required(VERSION 3.25)
 project(wrapper)
 include(ExternalProject)
 
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 11)
 
 set(ANDROID_NDK_PATH "$ENV{HOME}/android-ndk-r23b")
@@ -18,12 +19,13 @@ set(HANDLE_SOURCE main.cpp)
 set(CJSON_SOURCE cjson/cjson.c)
 set(MAIN_SOURCE main.c)
 set(WRAPPER_SOURCE wrapper.c)
+set(THREAD_POOL_SOURCE thread_pool.c)
 
 add_library(cmdline_object OBJECT ${CMDLINE_SOURCE})
 add_library(handle_object OBJECT ${HANDLE_SOURCE})
 add_library(cjson_object OBJECT ${CJSON_SOURCE})
 
-add_executable(main ${MAIN_SOURCE} $<TARGET_OBJECTS:cmdline_object> $<TARGET_OBJECTS:handle_object> $<TARGET_OBJECTS:cjson_object>)
+add_executable(main ${MAIN_SOURCE} ${THREAD_POOL_SOURCE} $<TARGET_OBJECTS:cmdline_object> $<TARGET_OBJECTS:handle_object> $<TARGET_OBJECTS:cjson_object>)
 
 set_target_properties(main PROPERTIES 
     COMPILE_DEFINITIONS "MyRelease"
@@ -37,12 +39,15 @@ find_library(CXX_SHARED_LIB c++_shared PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/l
 find_library(CURL_SHARED_LIB curl PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 find_library(LOG_SHARED_LIB log PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 
+find_package(Threads REQUIRED)
+
 # Link libraries
 target_link_libraries(main
     ${CXX_SHARED_LIB}
     ${ANDROIDAPPMUSIC_LIB}
     ${STORESERVICESCORE_LIB}
     ${MEDIAPLATFORM_LIB}
+    Threads::Threads
 )
 
 get_target_property(MAIN_COMPILE_DEFINITIONS main COMPILE_DEFINITIONS)
