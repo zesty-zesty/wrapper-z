@@ -4,6 +4,7 @@ project(wrapper)
 include(ExternalProject)
 
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 11)
 
 set(ANDROID_NDK_PATH "$ENV{HOME}/android-ndk-r23b")
@@ -63,12 +64,23 @@ endif()
 
 link_directories(${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 
+# Select wrapper build command per host platform (keep lines above intact)
+if(APPLE)
+    # Build macOS arm64 wrapper using Apple clang
+    set(WRAPPER_BUILD_CMD "clang -O3 -Wall -arch arm64 -o wrapper ${WRAPPER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmdline.c")
+elseif(UNIX)
+    # Build Linux aarch64 wrapper using cross compiler
+    set(WRAPPER_BUILD_CMD "aarch64-linux-gnu-gcc -O3 -Wall -o wrapper ${WRAPPER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmdline.c")
+else()
+    message(FATAL_ERROR "Unsupported host platform for wrapper build")
+endif()
+
 ExternalProject_Add(
     wrapper
     PREFIX ${CMAKE_BINARY_DIR}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND aarch64-linux-gnu-gcc -O3 -Wall -o wrapper ${WRAPPER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmdline.c
+    BUILD_COMMAND ${WRAPPER_BUILD_CMD}
     BUILD_IN_SOURCE 1
     INSTALL_COMMAND ""
     DEPENDS main
