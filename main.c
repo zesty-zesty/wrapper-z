@@ -830,10 +830,21 @@ char* get_account_storefront_id(struct shared_ptr reqCtx) {
 }
 
 void write_storefront_id(struct shared_ptr reqCtx) {
-    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"), "w");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", args_info.base_dir_arg, "STOREFRONT_ID");
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
     char *storefront_id = get_account_storefront_id(reqCtx);
-    printf("[+] StoreFront ID: %s\n", storefront_id);
-    fprintf(fp, "%s", get_account_storefront_id(reqCtx));
+    if (storefront_id) {
+        printf("[+] StoreFront ID: %s\n", storefront_id);
+        fprintf(fp, "%s", storefront_id);
+        free(storefront_id);
+    } else {
+        fprintf(stderr, "[!] StoreFront ID unavailable\n");
+    }
     fclose(fp);
 }
 
@@ -939,32 +950,44 @@ char* get_dev_token(struct shared_ptr reqCtx) {
 }
 
 void write_music_token(struct shared_ptr reqCtx) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", args_info.base_dir_arg, "MUSIC_TOKEN");
     int token_file_available = 0;
-    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
-        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
-        if (NULL != fp) {
-            fseek (fp, 0, SEEK_END);
-            long size = ftell(fp);
-
-            if (0 != size) {
-                token_file_available = 1;
+    if (file_exists(path)) {
+        FILE *rfp = fopen(path, "r");
+        if (rfp != NULL) {
+            if (fseek(rfp, 0, SEEK_END) == 0) {
+                long size = ftell(rfp);
+                if (size > 0) token_file_available = 1;
             }
+            fclose(rfp);
         }
     }
     if (token_file_available) {
-        char token[256];
-        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
-        fgets(token, sizeof(token), fp);
+        char token[256] = {0};
+        FILE *rfp = fopen(path, "r");
+        if (rfp) {
+            fgets(token, sizeof(token), rfp);
+            fclose(rfp);
+        }
         printf("[+] Music-Token: %.14s...\n", token);
         return;
     }
-    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "w");
+    FILE *wfp = fopen(path, "w");
+    if (!wfp) {
+        perror("fopen");
+        return;
+    }
     char *guid = get_guid();
     char *dev_token = get_dev_token(reqCtx);
     char *token = get_music_user_token(guid, dev_token, reqCtx);
-    printf("[+] Music-Token: %.14s...\n", token);
-    fprintf(fp, "%s", token);
-    fclose(fp);
+    if (token) {
+        printf("[+] Music-Token: %.14s...\n", token);
+        fprintf(wfp, "%s", token);
+    } else {
+        fprintf(stderr, "[!] Music-Token unavailable\n");
+    }
+    fclose(wfp);
 }
 
 int main(int argc, char *argv[]) {
@@ -987,8 +1010,7 @@ int main(int argc, char *argv[]) {
         amPassword = strtok(NULL, ":");
     }
     if (args_info.login_given && !login(ctx)) {
-        fprintf(stderr, "[!] login failed\n");
-        return EXIT_FAILURE;
+        fprintf(stderr, "[!] login failed, continuing without account-bound features\n");
     }
     _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
         leaseMgr, &endLeaseCallback, &pbErrCallback);
