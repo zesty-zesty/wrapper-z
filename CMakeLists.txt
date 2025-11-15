@@ -58,7 +58,7 @@ ExternalProject_Add(
     PREFIX ${CMAKE_BINARY_DIR}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND aarch64-linux-gnu-gcc -o wrapper ${WRAPPER_SOURCE}
+    BUILD_COMMAND aarch64-linux-gnu-gcc -O3 -Wall -o wrapper ${WRAPPER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmdline.c
     BUILD_IN_SOURCE 1
     INSTALL_COMMAND ""
     DEPENDS main
