@@ -244,7 +244,11 @@ static inline void init() {
     }
 
     static const char *resolvers[2] = {"223.5.5.5", "223.6.6.6"};
+#if defined(__ANDROID__)
     _resolv_set_nameservers_for_net(0, resolvers, 2, ".");
+#else
+    fprintf(stderr, "[~] 非 Android 平台，跳过 DNS 配置\n");
+#endif
     // Debug hook disabled on this platform; proceeding without subhook.
 
     // static char android_id[16];
@@ -274,8 +278,9 @@ static inline void init() {
 
 static inline struct shared_ptr init_ctx() {
     fprintf(stderr, "[+] initializing ctx...\n");
-
-    struct shared_ptr *reqCtx = newRequestContext(strcat_b(args_info.base_dir_arg, "/mpl_db"));
+    char *db_path = strcat_b(args_info.base_dir_arg, "/mpl_db");
+    struct shared_ptr *reqCtx = newRequestContext(db_path);
+    if (db_path) free(db_path);
     struct shared_ptr *reqCtxCfg = getRequestContextConfig();
 
     prepareRequestContextConfig(reqCtxCfg);
@@ -295,12 +300,16 @@ extern void *pbErrCallback;
 
 inline static uint8_t login(struct shared_ptr reqCtx) {
     fprintf(stderr, "[+] logging in...\n");
-    if (file_exists(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"))) {
-        remove(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"));
+    char *sf_path = strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID");
+    if (sf_path && file_exists(sf_path)) {
+        remove(sf_path);
     }
-    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
-        remove(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"));
+    if (sf_path) free(sf_path);
+    char *mt_path = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
+    if (mt_path && file_exists(mt_path)) {
+        remove(mt_path);
     }
+    if (mt_path) free(mt_path);
     struct shared_ptr flow;
     _ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_ASM(
         &flow, &reqCtx);
@@ -708,11 +717,27 @@ char* get_account_storefront_id(struct shared_ptr reqCtx) {
 }
 
 void write_storefront_id(struct shared_ptr reqCtx) {
-    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"), "w");
+    char *path = strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID");
+    if (!path) {
+        fprintf(stderr, "[!] 路径分配失败: STOREFRONT_ID\n");
+        return;
+    }
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "[!] 无法写入文件: %s (%s)\n", path, strerror(errno));
+        free(path);
+        return;
+    }
     char *storefront_id = get_account_storefront_id(reqCtx);
-    printf("[+] StoreFront ID: %s\n", storefront_id);
-    fprintf(fp, "%s", get_account_storefront_id(reqCtx));
+    if (storefront_id) {
+        printf("[+] StoreFront ID: %s\n", storefront_id);
+        fprintf(fp, "%s", storefront_id);
+        free(storefront_id);
+    } else {
+        fprintf(stderr, "[!] 未能获取 StoreFront ID\n");
+    }
     fclose(fp);
+    free(path);
 }
 
 char *get_guid() {
@@ -812,37 +837,54 @@ char* get_dev_token(struct shared_ptr reqCtx) {
     cJSON *json = cJSON_Parse(respBody);
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "token");
     char *token = cJSON_GetStringValue(token_obj);
-    char *result = strdup(token);
+    char *result = token ? strdup(token) : NULL;
+    if (json) cJSON_Delete(json);
     return result;
 }
 
 void write_music_token(struct shared_ptr reqCtx) {
     int token_file_available = 0;
-    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
-        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
-        if (NULL != fp) {
+    char *token_path = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
+    if (token_path && file_exists(token_path)) {
+        FILE *fp = fopen(token_path, "r");
+        if (fp) {
             fseek (fp, 0, SEEK_END);
             long size = ftell(fp);
-
-            if (0 != size) {
+            fclose(fp);
+            if (size > 0) {
                 token_file_available = 1;
             }
         }
     }
     if (token_file_available) {
         char token[256];
-        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
-        fgets(token, sizeof(token), fp);
-        printf("[+] Music-Token: %.14s...\n", token);
+        FILE *fp = fopen(token_path, "r");
+        if (!fp) {
+            fprintf(stderr, "[!] 无法读取文件: %s (%s)\n", token_path, strerror(errno));
+        } else {
+            if (fgets(token, sizeof(token), fp) != NULL) {
+                printf("[+] Music-Token: %.14s...\n", token);
+            }
+            fclose(fp);
+        }
+        if (token_path) free(token_path);
         return;
     }
-    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "w");
+    FILE *fp = fopen(token_path ? token_path : "/MUSIC_TOKEN", "w");
+    if (!fp) {
+        fprintf(stderr, "[!] 无法写入文件: %s (%s)\n", token_path ? token_path : "/MUSIC_TOKEN", strerror(errno));
+        if (token_path) free(token_path);
+        return;
+    }
     char *guid = get_guid();
     char *dev_token = get_dev_token(reqCtx);
     char *token = get_music_user_token(guid, dev_token, reqCtx);
     printf("[+] Music-Token: %.14s...\n", token);
     fprintf(fp, "%s", token);
     fclose(fp);
+    if (token_path) free(token_path);
+    if (dev_token) free(dev_token);
+    if (token) free(token);
 }
 
 int main(int argc, char *argv[]) {
