@@ -82,6 +82,13 @@ static volatile sig_atomic_t shutdown_flag = 0;
 static int listen_fd_dec = -1;
 static int listen_fd_m3u8 = -1;
 static thread_pool *g_pool = NULL;
+static volatile sig_atomic_t platform_init_ok = 0;
+static volatile sig_atomic_t ctx_init_ok = 0;
+static sigjmp_buf init_jmp;
+static sigjmp_buf ctx_jmp;
+
+static void segv_handler_init(int sig) { (void)sig; fprintf(stderr, "[!] init crashed, skipping platform init\n"); siglongjmp(init_jmp, 1); }
+static void segv_handler_ctx(int sig) { (void)sig; fprintf(stderr, "[!] init_ctx crashed, skipping context init\n"); siglongjmp(ctx_jmp, 1); }
 
 #ifndef MyRelease
 int32_t CURLOPT_SSL_VERIFYPEER = 64;
@@ -1012,8 +1019,42 @@ int main(int argc, char *argv[]) {
     subhook_install(subhook_new(__android_log_write, android_log_write_hook, SUBHOOK_64BIT_OFFSET));
     #endif
 
-    init();
-    const struct shared_ptr ctx = init_ctx();
+    // Protect init() from crashing due to external platform dependencies
+    struct sigaction old_segv, old_bus, old_abrt, new_segv; memset(&new_segv, 0, sizeof(new_segv));
+    new_segv.sa_handler = segv_handler_init; sigemptyset(&new_segv.sa_mask);
+    sigaction(SIGSEGV, &new_segv, &old_segv);
+    sigaction(SIGBUS,  &new_segv, &old_bus);
+    sigaction(SIGABRT, &new_segv, &old_abrt);
+    if (sigsetjmp(init_jmp, 1) == 0) {
+        init();
+        platform_init_ok = 1;
+    } else {
+        platform_init_ok = 0;
+    }
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS,  &old_bus,  NULL);
+    sigaction(SIGABRT, &old_abrt, NULL);
+    // Protect init_ctx() from crashing due to external dependencies
+    struct shared_ptr ctx_default = {.obj = NULL, .ctrl_blk = NULL};
+    struct shared_ptr ctx;
+    memset((void*)&ctx, 0, sizeof(ctx));
+    memset((void*)&ctx_default, 0, sizeof(ctx_default));
+    memset(&new_segv, 0, sizeof(new_segv));
+    struct sigaction old_segv2, old_bus2, old_abrt2; memset(&new_segv, 0, sizeof(new_segv));
+    new_segv.sa_handler = segv_handler_ctx; sigemptyset(&new_segv.sa_mask);
+    sigaction(SIGSEGV, &new_segv, &old_segv2);
+    sigaction(SIGBUS,  &new_segv, &old_bus2);
+    sigaction(SIGABRT, &new_segv, &old_abrt2);
+    if (sigsetjmp(ctx_jmp, 1) == 0) {
+        ctx = init_ctx();
+        ctx_init_ok = 1;
+    } else {
+        ctx = ctx_default;
+        ctx_init_ok = 0;
+    }
+    sigaction(SIGSEGV, &old_segv2, NULL);
+    sigaction(SIGBUS,  &old_bus2,  NULL);
+    sigaction(SIGABRT, &old_abrt2, NULL);
     if (args_info.login_given) {
         amUsername = strtok(args_info.login_arg, ":");
         amPassword = strtok(NULL, ":");
@@ -1022,15 +1063,25 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[!] login failed, continuing without account-bound features\n");
     }
     // 使用更大的缓冲区承载 SVPlaybackLeaseManager，避免构造函数越界写入
-    _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
-        leaseMgr, &endLeaseCallback, &pbErrCallback);
+    if (platform_init_ok) {
+        _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
+            leaseMgr, &endLeaseCallback, &pbErrCallback);
+    } else {
+        fprintf(stderr, "[!] Skipping LeaseManager init due to platform init failure\n");
+    }
     uint8_t autom = 1;
-    lease_refresh_automatically_wrapped(&autom);
-    lease_request_wrapped(&autom);
-    FHinstance = _ZN21SVFootHillSessionCtrl8instanceEv();
+    if (platform_init_ok) {
+        lease_refresh_automatically_wrapped(&autom);
+        lease_request_wrapped(&autom);
+        FHinstance = _ZN21SVFootHillSessionCtrl8instanceEv();
+    }
 
-    write_storefront_id(ctx);
-    write_music_token(ctx);
+    if (platform_init_ok && ctx_init_ok) {
+        write_storefront_id(ctx);
+        write_music_token(ctx);
+    } else {
+        fprintf(stderr, "[!] Skipping ID/Token generation due to init failure (platform/ctx)\n");
+    }
 
     struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = handle_sig; sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
 
@@ -1038,11 +1089,17 @@ int main(int argc, char *argv[]) {
     g_pool = thread_pool_create(nthreads, maxq);
 
     pthread_t m3u8_thread;
-    pthread_create(&m3u8_thread, NULL, &new_socket_m3u8, NULL);
+    if (platform_init_ok) {
+        pthread_create(&m3u8_thread, NULL, &new_socket_m3u8, NULL);
+    } else {
+        fprintf(stderr, "[!] Skipping m3u8 thread due to platform init failure\n");
+    }
 
     int rc = new_socket();
     shutdown_flag = 1;
     thread_pool_shutdown(g_pool);
-    pthread_join(m3u8_thread, NULL);
+    if (platform_init_ok) {
+        pthread_join(m3u8_thread, NULL);
+    }
     return rc;
 }
