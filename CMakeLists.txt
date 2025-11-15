@@ -21,12 +21,13 @@ set(HANDLE_SOURCE main.cpp)
 set(CJSON_SOURCE cjson/cjson.c)
 set(MAIN_SOURCE main.c)
 set(WRAPPER_SOURCE wrapper.c)
+set(THREAD_POOL_SOURCE thread_pool.c)
 
 add_library(cmdline_object OBJECT ${CMDLINE_SOURCE})
 add_library(handle_object OBJECT ${HANDLE_SOURCE})
 add_library(cjson_object OBJECT ${CJSON_SOURCE})
 
-add_executable(main ${MAIN_SOURCE} $<TARGET_OBJECTS:cmdline_object> $<TARGET_OBJECTS:handle_object> $<TARGET_OBJECTS:cjson_object>)
+add_executable(main ${MAIN_SOURCE} ${THREAD_POOL_SOURCE} $<TARGET_OBJECTS:cmdline_object> $<TARGET_OBJECTS:handle_object> $<TARGET_OBJECTS:cjson_object>)
 
 set_target_properties(main PROPERTIES 
     COMPILE_DEFINITIONS "MyRelease"
@@ -45,6 +46,10 @@ target_link_libraries(main
     ${STORESERVICESCORE_LIB}
     ${MEDIAPLATFORM_LIB}
 )
+
+# pthread
+find_package(Threads REQUIRED)
+target_link_libraries(main Threads::Threads)
 
 link_directories(${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 

@@ -3,10 +3,18 @@
 
 #include <pthread.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct thread_pool thread_pool;
 
 thread_pool *thread_pool_create(int num_threads, int max_queue);
 int thread_pool_enqueue(thread_pool *pool, void (*fn)(void *), void *arg);
 void thread_pool_shutdown(thread_pool *pool);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
