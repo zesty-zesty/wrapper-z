@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.25)
 project(wrapper)
 include(ExternalProject)
 
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 11)
 
 set(ANDROID_NDK_PATH "$ENV{HOME}/android-ndk-r23b")
@@ -45,11 +45,21 @@ target_link_libraries(main
     ${ANDROIDAPPMUSIC_LIB}
     ${STORESERVICESCORE_LIB}
     ${MEDIAPLATFORM_LIB}
+    Threads::Threads
 )
 
-# pthread
-find_package(Threads REQUIRED)
-target_link_libraries(main Threads::Threads)
+get_target_property(MAIN_COMPILE_DEFINITIONS main COMPILE_DEFINITIONS)
+if(NOT "MyRelease" IN_LIST MAIN_COMPILE_DEFINITIONS)
+    target_link_libraries(main
+        ${LOG_SHARED_LIB}
+        ${CURL_SHARED_LIB}
+    )
+    set(CMAKE_C_FLAGS "-Werror -g")
+    set(CMAKE_CXX_FLAGS "-Werror -g")
+else()
+    set(CMAKE_C_FLAGS "-Wall -Werror")
+    set(CMAKE_CXX_FLAGS "-Wall -Werror")
+endif()
 
 link_directories(${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 
