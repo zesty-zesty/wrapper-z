@@ -58,5 +58,3 @@ jobs:
         name: Wrapper-z.x86_64.${{ steps.vars.outputs.sha_short }}
         tag_name: Wrapper-z.x86_64.${{ steps.vars.outputs.sha_short }}
         make_latest: true
-        
-
