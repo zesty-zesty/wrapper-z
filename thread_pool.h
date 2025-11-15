@@ -1,38 +1,36 @@
-#pragma once
+#ifndef THREAD_POOL_H
+#define THREAD_POOL_H
 
 #include <pthread.h>
-#include <stdatomic.h>
-#include <stddef.h>
 
-typedef void (*tp_task_fn)(void *arg);
+// 任务结构体
+typedef struct {
+    void (*function)(void *arg);
+    void *argument;
+} thread_task_t;
 
-typedef struct tp_task {
-    tp_task_fn fn;
-    void *arg;
-    struct tp_task *next;
-} tp_task;
-
-typedef struct thread_pool {
+// 线程池结构体
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t notify;
     pthread_t *threads;
-    size_t nthreads;
+    thread_task_t *queue;
+    int thread_count;
+    int queue_size;
+    int head;
+    int tail;
+    int count;
+    int shutdown;
+    int started;
+} thread_pool_t;
 
-    pthread_mutex_t mtx;
-    pthread_cond_t cv;
+// 创建线程池
+thread_pool_t *thread_pool_create(int thread_count, int queue_size);
 
-    tp_task *head;
-    tp_task *tail;
+// 添加任务到线程池
+int thread_pool_add(thread_pool_t *pool, void (*function)(void *), void *argument);
 
-    atomic_int stop;
-} thread_pool;
+// 销毁线程池
+int thread_pool_destroy(thread_pool_t *pool);
 
-// Create a thread pool with n worker threads. Returns NULL on failure.
-thread_pool *thread_pool_create(size_t nthreads);
-
-// Submit a task. Returns 0 on success, non-zero on failure or when stopping.
-int thread_pool_submit(thread_pool *pool, tp_task_fn fn, void *arg);
-
-// Signal shutdown; when wait is non-zero, join all workers.
-void thread_pool_shutdown(thread_pool *pool, int wait);
-
-// Destroy and free all resources. Call after shutdown(wait=1).
-void thread_pool_destroy(thread_pool *pool);
+#endif // THREAD_POOL_H

@@ -1,7 +1,6 @@
 FROM ubuntu:latest
 
 WORKDIR /app
-#COPY --from=builder /app /app
 COPY . /app
 ENV args ""
 

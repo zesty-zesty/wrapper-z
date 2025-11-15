@@ -6,8 +6,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <stdatomic.h>
-#include <stdbool.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -68,32 +66,11 @@ static int accept4_compat(int fd, struct sockaddr *addr, socklen_t *addrlen, int
 #endif
 }
 
-// Graceful shutdown and shared resources
-static atomic_bool shutdown_requested = ATOMIC_VAR_INIT(false);
-static int decrypt_listen_fd = -1;
-static int m3u8_listen_fd = -1;
-static thread_pool *g_pool = NULL;
-static pthread_mutex_t lease_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void handle_signal(int signum) {
-    (void)signum;
-    atomic_store(&shutdown_requested, true);
-    if (decrypt_listen_fd != -1) {
-        close(decrypt_listen_fd);
-        decrypt_listen_fd = -1;
-    }
-    if (m3u8_listen_fd != -1) {
-        close(m3u8_listen_fd);
-        m3u8_listen_fd = -1;
-    }
-}
-
 static struct shared_ptr apInf;
 static uint8_t leaseMgr[16];
 struct gengetopt_args_info args_info;
 char *amUsername, *amPassword;
 struct shared_ptr GUID;
-// Global state declared earlier
 
 int file_exists(char *filename) {
   struct stat buffer;   
@@ -244,23 +221,17 @@ static inline void init() {
     }
 
     static const char *resolvers[2] = {"223.5.5.5", "223.6.6.6"};
-#if defined(__ANDROID__)
     _resolv_set_nameservers_for_net(0, resolvers, 2, ".");
-#else
-    fprintf(stderr, "[~] 非 Android 平台，跳过 DNS 配置\n");
-#endif
     // Debug hook disabled on this platform; proceeding without subhook.
 
     // static char android_id[16];
     // for (int i = 0; i < 16; ++i) {
     //     android_id[i] = "0123456789abcdef"[rand() % 16];
     // }
-    fprintf(stderr, "[.] init: configuring FootHill...\n");
     union std_string conf1 = new_std_string(android_id);
     union std_string conf2 = new_std_string("");
     _ZN14FootHillConfig6configERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE(
         &conf1);
-    fprintf(stderr, "[.] init: FootHill configured\n");
 
     // union std_string root = new_std_string("/");
     // union std_string natLib = new_std_string("/system/lib64/");
@@ -269,24 +240,19 @@ static inline void init() {
     //     foothill, &root, &natLib);
     // _ZN8FootHill24defaultContextIdentifierEv(foothill);
 
-    fprintf(stderr, "[.] init: acquiring DeviceGUID instance...\n");
     _ZN17storeservicescore10DeviceGUID8instanceEvASM(&GUID);
-    fprintf(stderr, "[.] init: DeviceGUID acquired\n");
 
     static uint8_t ret[88];
     static unsigned int conf3 = 29;
     static uint8_t conf4 = 1;
-    fprintf(stderr, "[.] init: configuring DeviceGUID...\n");
     _ZN17storeservicescore10DeviceGUID9configureERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_RKjRKbASM(
         &ret, GUID.obj, &conf1, &conf2, &conf3, &conf4);
-    fprintf(stderr, "[+] init: DeviceGUID configured\n");
 }
 
 static inline struct shared_ptr init_ctx() {
     fprintf(stderr, "[+] initializing ctx...\n");
-    char *db_path = strcat_b(args_info.base_dir_arg, "/mpl_db");
-    struct shared_ptr *reqCtx = newRequestContext(db_path);
-    if (db_path) free(db_path);
+
+    struct shared_ptr *reqCtx = newRequestContext(strcat_b(args_info.base_dir_arg, "/mpl_db"));
     struct shared_ptr *reqCtxCfg = getRequestContextConfig();
 
     prepareRequestContextConfig(reqCtxCfg);
@@ -306,16 +272,12 @@ extern void *pbErrCallback;
 
 inline static uint8_t login(struct shared_ptr reqCtx) {
     fprintf(stderr, "[+] logging in...\n");
-    char *sf_path = strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID");
-    if (sf_path && file_exists(sf_path)) {
-        remove(sf_path);
+    if (file_exists(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"))) {
+        remove(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"));
     }
-    if (sf_path) free(sf_path);
-    char *mt_path = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
-    if (mt_path && file_exists(mt_path)) {
-        remove(mt_path);
+    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
+        remove(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"));
     }
-    if (mt_path) free(mt_path);
     struct shared_ptr flow;
     _ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_ASM(
         &flow, &reqCtx);
@@ -375,12 +337,11 @@ inline static void *getKdContext(const char *const adam,
         if (preshareCtx != NULL) {
             void *cached = preshareCtx;
             pthread_mutex_unlock(&preshare_mutex);
-            fprintf(stderr, "[+] getKdContext: returning cached preshare context\n");
             return cached;
         }
         pthread_mutex_unlock(&preshare_mutex);
     }
-    fprintf(stderr, "[.] getKdContext: adamId: %s, uri: %s\n", adam, uri);
+    fprintf(stderr, "[.] adamId: %s, uri: %s\n", adam, uri);
 
     union std_string defaultId = new_std_string(adam);
     union std_string keyUri = new_std_string(uri);
@@ -393,37 +354,26 @@ inline static void *getKdContext(const char *const adam,
     union std_string fpsCert = new_std_string(fairplay_cert);
 
     struct shared_ptr persistK = {.obj = NULL};
-    fprintf(stderr, "[.] getKdContext: calling getPersistentKey...\n");
     _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_ASM(
         &persistK, FHinstance, &defaultId, &defaultId, &keyUri, &keyFormat,
         &keyFormatVer, &serverUri, &protocolType, &fpsCert);
 
-    if (persistK.obj == NULL) {
-        fprintf(stderr, "[!] getKdContext: getPersistentKey failed, persistK.obj is NULL\n");
+    if (persistK.obj == NULL)
         return NULL;
-    }
-    fprintf(stderr, "[.] getKdContext: getPersistentKey successful, persistK.obj: %p\n", persistK.obj);
 
     struct shared_ptr SVFootHillPContext;
-    fprintf(stderr, "[.] getKdContext: calling decryptContext...\n");
     _ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKbASM(
         &SVFootHillPContext, FHinstance, persistK.obj);
 
-    if (SVFootHillPContext.obj == NULL) {
-        fprintf(stderr, "[!] getKdContext: decryptContext failed, SVFootHillPContext.obj is NULL\n");
+    if (SVFootHillPContext.obj == NULL)
         return NULL;
-    }
-    fprintf(stderr, "[.] getKdContext: decryptContext successful, SVFootHillPContext.obj: %p\n", SVFootHillPContext.obj);
 
     void *kdContext =
         *_ZNK18SVFootHillPContext9kdContextEv(SVFootHillPContext.obj);
-    fprintf(stderr, "[.] getKdContext: kdContext from SVFootHillPContext: %p\n", kdContext);
-
     if (kdContext != NULL && isPreshare) {
         pthread_mutex_lock(&preshare_mutex);
         preshareCtx = kdContext;
         pthread_mutex_unlock(&preshare_mutex);
-        fprintf(stderr, "[+] getKdContext: cached preshare context\n");
     }
     return kdContext;
 }
@@ -486,15 +436,13 @@ extern uint8_t handle_cpp(int);
 void handle_m3u8(const int connfd);
 
 typedef struct { int fd; } decrypt_conn_args;
-static void decrypt_task(void *arg) {
+static void decrypt_conn(void *arg) {
     decrypt_conn_args *a = (decrypt_conn_args *)arg;
     int cfd = a->fd;
     free(a);
     if (!handle_cpp(cfd)) {
         uint8_t autom = 1;
-        pthread_mutex_lock(&lease_mutex);
         _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
-        pthread_mutex_unlock(&lease_mutex);
     }
     if (close(cfd) == -1) {
         perror("close");
@@ -502,7 +450,7 @@ static void decrypt_task(void *arg) {
 }
 
 typedef struct { int fd; } m3u8_conn_args;
-static void m3u8_task(void *arg) {
+static void m3u8_conn(void *arg) {
     m3u8_conn_args *a = (m3u8_conn_args *)arg;
     int cfd = a->fd;
     free(a);
@@ -512,13 +460,12 @@ static void m3u8_task(void *arg) {
     }
 }
 
-inline static int new_socket() {
+inline static int new_socket(thread_pool_t *pool) {
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
     if (fd == -1) {
         perror("socket");
         return EXIT_FAILURE;
     }
-    decrypt_listen_fd = fd;
     const int optval = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
@@ -540,16 +487,16 @@ inline static int new_socket() {
 
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
-    while (!atomic_load(&shutdown_requested)) {
+    while (1) {
         const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
-            if (atomic_load(&shutdown_requested)) break;
             if (is_transient_accept_errno(errno))
                 continue;
             perror("accept");
-            break;
+            return EXIT_FAILURE;
         }
+
         decrypt_conn_args *args = (decrypt_conn_args *)malloc(sizeof(decrypt_conn_args));
         if (args == NULL) {
             perror("malloc");
@@ -557,26 +504,8 @@ inline static int new_socket() {
             continue;
         }
         args->fd = connfd;
-        int rc = thread_pool_submit(g_pool, decrypt_task, (void *)args);
-        if (rc != 0) {
-            // fallback: handle synchronously
-            if (!handle_cpp(connfd)) {
-                uint8_t autom = 1;
-                pthread_mutex_lock(&lease_mutex);
-                _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
-                pthread_mutex_unlock(&lease_mutex);
-            }
-            if (close(connfd) == -1) {
-                perror("close");
-            }
-            free(args);
-        }
+        thread_pool_add(pool, decrypt_conn, args);
     }
-    if (close(fd) == -1) {
-        perror("close");
-    }
-    decrypt_listen_fd = -1;
-    return EXIT_SUCCESS;
 }
 
 
@@ -585,11 +514,9 @@ const char* get_m3u8_method_play(uint8_t leaseMgr[16], unsigned long adam) {
     struct std_vector HLSParam = new_std_vector(&HLS);
     static uint8_t z0 = 0;
     struct shared_ptr ptr_result;
-    pthread_mutex_lock(&lease_mutex);
     _ZN22SVPlaybackLeaseManager12requestAssetERKmRKNSt6__ndk16vectorINS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS7_IS9_EEEERKbASM(
         &ptr_result, leaseMgr, &adam, &HLSParam, &z0
     );
-    pthread_mutex_unlock(&lease_mutex);
     
     if (ptr_result.obj == NULL) {
         return NULL;
@@ -661,12 +588,13 @@ void handle_m3u8(const int connfd) {
     }
 }
 
-static inline void *new_socket_m3u8(void *args) {
+static inline void *new_socket_m3u8(void *pool_ptr) {
+    thread_pool_t *pool = (thread_pool_t *)pool_ptr;
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
     if (fd == -1) {
         perror("socket");
+        return NULL;
     }
-    m3u8_listen_fd = fd;
     const int optval = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
@@ -686,17 +614,16 @@ static inline void *new_socket_m3u8(void *args) {
 
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
-    while (!atomic_load(&shutdown_requested)) {
+    while (1) {
         const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
-            if (atomic_load(&shutdown_requested)) break;
             if (is_transient_accept_errno(errno))
                 continue;
             perror("accept");
-            break;
+            
         }
-        // submit to thread pool
+
         m3u8_conn_args *args_m = (m3u8_conn_args *)malloc(sizeof(m3u8_conn_args));
         if (args_m == NULL) {
             perror("malloc");
@@ -704,21 +631,8 @@ static inline void *new_socket_m3u8(void *args) {
             continue;
         }
         args_m->fd = connfd;
-        int rc = thread_pool_submit(g_pool, m3u8_task, (void *)args_m);
-        if (rc != 0) {
-            // fallback: handle synchronously
-            handle_m3u8(connfd);
-            if (close(connfd) == -1) {
-                perror("close");
-            }
-            free(args_m);
-        }
+        thread_pool_add(pool, m3u8_conn, args_m);
     }
-    if (close(fd) == -1) {
-        perror("close");
-    }
-    m3u8_listen_fd = -1;
-    return NULL;
 }
 
 char* get_account_storefront_id(struct shared_ptr reqCtx) {
@@ -735,27 +649,11 @@ char* get_account_storefront_id(struct shared_ptr reqCtx) {
 }
 
 void write_storefront_id(struct shared_ptr reqCtx) {
-    char *path = strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID");
-    if (!path) {
-        fprintf(stderr, "[!] 路径分配失败: STOREFRONT_ID\n");
-        return;
-    }
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        fprintf(stderr, "[!] 无法写入文件: %s (%s)\n", path, strerror(errno));
-        free(path);
-        return;
-    }
+    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"), "w");
     char *storefront_id = get_account_storefront_id(reqCtx);
-    if (storefront_id) {
-        printf("[+] StoreFront ID: %s\n", storefront_id);
-        fprintf(fp, "%s", storefront_id);
-        free(storefront_id);
-    } else {
-        fprintf(stderr, "[!] 未能获取 StoreFront ID\n");
-    }
+    printf("[+] StoreFront ID: %s\n", storefront_id);
+    fprintf(fp, "%s", get_account_storefront_id(reqCtx));
     fclose(fp);
-    free(path);
 }
 
 char *get_guid() {
@@ -819,8 +717,7 @@ char *get_music_user_token(char *guid, char *authToken, struct shared_ptr reqCtx
     cJSON *json = cJSON_Parse(respBody);
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "music_token");
     char *token = cJSON_GetStringValue(token_obj);
-    char *result = token ? strdup(token) : NULL;
-    if (json) cJSON_Delete(json);
+    char *result = strdup(token);
     return result;
 }
 
@@ -856,68 +753,41 @@ char* get_dev_token(struct shared_ptr reqCtx) {
     cJSON *json = cJSON_Parse(respBody);
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "token");
     char *token = cJSON_GetStringValue(token_obj);
-    char *result = token ? strdup(token) : NULL;
-    if (json) cJSON_Delete(json);
+    char *result = strdup(token);
     return result;
 }
 
 void write_music_token(struct shared_ptr reqCtx) {
     int token_file_available = 0;
-    char *token_path = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
-    if (token_path && file_exists(token_path)) {
-        FILE *fp = fopen(token_path, "r");
-        if (fp) {
+    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
+        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
+        if (NULL != fp) {
             fseek (fp, 0, SEEK_END);
             long size = ftell(fp);
-            fclose(fp);
-            if (size > 0) {
+
+            if (0 != size) {
                 token_file_available = 1;
             }
         }
     }
     if (token_file_available) {
         char token[256];
-        FILE *fp = fopen(token_path, "r");
-        if (!fp) {
-            fprintf(stderr, "[!] 无法读取文件: %s (%s)\n", token_path, strerror(errno));
-        } else {
-            if (fgets(token, sizeof(token), fp) != NULL) {
-                printf("[+] Music-Token: %.14s...\n", token);
-            }
-            fclose(fp);
-        }
-        if (token_path) free(token_path);
+        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
+        fgets(token, sizeof(token), fp);
+        printf("[+] Music-Token: %.14s...\n", token);
         return;
     }
-    FILE *fp = fopen(token_path ? token_path : "/MUSIC_TOKEN", "w");
-    if (!fp) {
-        fprintf(stderr, "[!] 无法写入文件: %s (%s)\n", token_path ? token_path : "/MUSIC_TOKEN", strerror(errno));
-        if (token_path) free(token_path);
-        return;
-    }
+    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "w");
     char *guid = get_guid();
     char *dev_token = get_dev_token(reqCtx);
     char *token = get_music_user_token(guid, dev_token, reqCtx);
     printf("[+] Music-Token: %.14s...\n", token);
     fprintf(fp, "%s", token);
     fclose(fp);
-    if (token_path) free(token_path);
-    // token is strdup'ed in get_music_user_token, safe to free
-    if (token) free(token);
-    if (dev_token) free(dev_token);
 }
 
 int main(int argc, char *argv[]) {
     cmdline_parser(argc, argv, &args_info);
-
-    // Install signal handlers for graceful shutdown
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
 
     init();
     const struct shared_ptr ctx = init_ctx();
@@ -940,22 +810,15 @@ int main(int argc, char *argv[]) {
     write_storefront_id(ctx);
     write_music_token(ctx);
 
-    // Create thread pool: use number of online CPUs (fallback to 8)
-    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    size_t nthreads = (size_t)((nproc > 0 && nproc <= 64) ? nproc : 8);
-    g_pool = thread_pool_create(nthreads);
-    if (!g_pool) {
-        fprintf(stderr, "[!] failed to create thread pool\n");
-        return EXIT_FAILURE;
-    }
+    thread_pool_t *pool = thread_pool_create(4);
 
     pthread_t m3u8_thread;
-    pthread_create(&m3u8_thread, NULL, &new_socket_m3u8, NULL);
+    pthread_create(&m3u8_thread, NULL, new_socket_m3u8, pool);
     pthread_detach(m3u8_thread);
 
-    int ret = new_socket();
-    thread_pool_shutdown(g_pool, 1);
-    thread_pool_destroy(g_pool);
-    g_pool = NULL;
-    return ret;
+    new_socket(pool);
+
+    thread_pool_destroy(pool);
+
+    return 0;
 }
