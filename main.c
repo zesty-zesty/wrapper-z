@@ -69,7 +69,9 @@ static int accept4_compat(int fd, struct sockaddr *addr, socklen_t *addrlen, int
 }
 
 static struct shared_ptr apInf;
-static uint8_t leaseMgr[16];
+// SVPlaybackLeaseManager 对象体积未知，原 16 字节可能不足导致溢出
+// 使用更大的缓冲区以避免构造函数越界写入导致崩溃
+static uint8_t leaseMgr[1024];
 struct gengetopt_args_info args_info;
 char *amUsername, *amPassword;
 struct shared_ptr GUID;
@@ -309,7 +311,7 @@ static inline void init() {
     // for (int i = 0; i < 16; ++i) {
     //     android_id[i] = "0123456789abcdef"[rand() % 16];
     // }
-    union std_string conf1 = new_std_string(device_infos[8]);
+    union std_string conf1 = new_std_string(device_infos[8] ? device_infos[8] : "");
     union std_string conf2 = new_std_string("");
     _ZN14FootHillConfig6configERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE(
         &conf1);
@@ -993,7 +995,14 @@ void write_music_token(struct shared_ptr reqCtx) {
 int main(int argc, char *argv[]) {
     cmdline_parser(argc, argv, &args_info);
     char *copy_that_needs_to_be_freed = NULL;
-    split_string_safe(args_info.device_info_arg, "/", device_infos, 9, &copy_that_needs_to_be_freed);
+    int di_count = 0;
+    if (args_info.device_info_arg && *args_info.device_info_arg) {
+        di_count = split_string_safe(args_info.device_info_arg, "/", device_infos, 9, &copy_that_needs_to_be_freed);
+    }
+    // 补齐缺失的 device_infos 段，避免后续对 device_infos[8] 的空指针解引用
+    for (int i = di_count; i < 9; ++i) {
+        device_infos[i] = "";
+    }
 
     #if !defined(MyRelease) && defined(HAVE_SUBHOOK)
     subhook_install(subhook_new(_ZN13mediaplatform26DebugLogEnabledForPriorityENS_11LogPriorityE, allDebug, SUBHOOK_64BIT_OFFSET));
@@ -1012,6 +1021,7 @@ int main(int argc, char *argv[]) {
     if (args_info.login_given && !login(ctx)) {
         fprintf(stderr, "[!] login failed, continuing without account-bound features\n");
     }
+    // 使用更大的缓冲区承载 SVPlaybackLeaseManager，避免构造函数越界写入
     _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
         leaseMgr, &endLeaseCallback, &pbErrCallback);
     uint8_t autom = 1;
