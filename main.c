@@ -639,6 +639,7 @@ static inline void *new_socket_m3u8(void *args) {
     if (fd == -1) {
         perror("socket");
     }
+    m3u8_listen_fd = fd;
     const int optval = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
@@ -690,6 +691,7 @@ static inline void *new_socket_m3u8(void *args) {
         perror("close");
     }
     m3u8_listen_fd = -1;
+    return NULL;
 }
 
 char* get_account_storefront_id(struct shared_ptr reqCtx) {

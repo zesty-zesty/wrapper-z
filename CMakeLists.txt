@@ -8,7 +8,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 11)
 
 set(ANDROID_NDK_PATH "$ENV{HOME}/android-ndk-r23b")
-set(TOOLCHAIN "${ANDROID_NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64")
+# Select correct NDK host tag based on the build host
+set(ANDROID_HOST_TAG "linux-x86_64")
+if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+    set(ANDROID_HOST_TAG "darwin-x86_64")
+elseif (WIN32)
+    set(ANDROID_HOST_TAG "windows-x86_64")
+endif()
+set(TOOLCHAIN "${ANDROID_NDK_PATH}/toolchains/llvm/prebuilt/${ANDROID_HOST_TAG}")
 
 set(CMAKE_C_COMPILER "${TOOLCHAIN}/bin/aarch64-linux-android22-clang")
 set(CMAKE_CXX_COMPILER "${TOOLCHAIN}/bin/aarch64-linux-android22-clang++")
@@ -28,11 +35,12 @@ add_library(handle_object OBJECT ${HANDLE_SOURCE})
 add_library(cjson_object OBJECT ${CJSON_SOURCE})
 add_library(thread_pool_object OBJECT thread_pool.c)
 
-add_executable(main ${MAIN_SOURCE} \
-    $<TARGET_OBJECTS:cmdline_object> \
-    $<TARGET_OBJECTS:handle_object> \
-    $<TARGET_OBJECTS:cjson_object> \
-    $<TARGET_OBJECTS:thread_pool_object>)
+add_executable(main ${MAIN_SOURCE}
+    $<TARGET_OBJECTS:cmdline_object>
+    $<TARGET_OBJECTS:handle_object>
+    $<TARGET_OBJECTS:cjson_object>
+    $<TARGET_OBJECTS:thread_pool_object>
+)
 
 set_target_properties(main PROPERTIES 
     COMPILE_DEFINITIONS "MyRelease"
@@ -45,6 +53,8 @@ find_library(MEDIAPLATFORM_LIB mediaplatform PATHS ${CMAKE_SOURCE_DIR}/rootfs/sy
 find_library(CXX_SHARED_LIB c++_shared PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 
 # Link libraries
+find_package(Threads REQUIRED)
+
 target_link_libraries(main
     ${CXX_SHARED_LIB}
     ${ANDROIDAPPMUSIC_LIB}
@@ -65,4 +75,3 @@ ExternalProject_Add(
     INSTALL_COMMAND ""
     DEPENDS main
 )
-find_package(Threads REQUIRED)
