@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <stdarg.h>
+#include <stdbool.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -20,7 +20,7 @@
 #include "cmdline.h"
 #include "cjson/cjson.h"
 #include "thread_pool.h"
-#include <netinet/tcp.h>
+
 // Portable compatibility for non-Linux platforms
 #ifndef SOCK_CLOEXEC
 #define SOCK_CLOEXEC 0
@@ -68,102 +68,32 @@ static int accept4_compat(int fd, struct sockaddr *addr, socklen_t *addrlen, int
 #endif
 }
 
+// Graceful shutdown and shared resources
+static atomic_bool shutdown_requested = ATOMIC_VAR_INIT(false);
+static int decrypt_listen_fd = -1;
+static int m3u8_listen_fd = -1;
+static thread_pool *g_pool = NULL;
+static pthread_mutex_t lease_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void handle_signal(int signum) {
+    (void)signum;
+    atomic_store(&shutdown_requested, true);
+    if (decrypt_listen_fd != -1) {
+        close(decrypt_listen_fd);
+        decrypt_listen_fd = -1;
+    }
+    if (m3u8_listen_fd != -1) {
+        close(m3u8_listen_fd);
+        m3u8_listen_fd = -1;
+    }
+}
+
 static struct shared_ptr apInf;
-// SVPlaybackLeaseManager 对象体积未知，原 16 字节可能不足导致溢出
-// 使用更大的缓冲区以避免构造函数越界写入导致崩溃
-static uint8_t leaseMgr[1024];
+static uint8_t leaseMgr[16];
 struct gengetopt_args_info args_info;
 char *amUsername, *amPassword;
 struct shared_ptr GUID;
-int decryptCount = 1000;
-char *device_infos[9];
-static pthread_mutex_t lease_mutex = PTHREAD_MUTEX_INITIALIZER;
-static volatile sig_atomic_t shutdown_flag = 0;
-static int listen_fd_dec = -1;
-static int listen_fd_m3u8 = -1;
-static thread_pool *g_pool = NULL;
-static volatile sig_atomic_t platform_init_ok = 0;
-static volatile sig_atomic_t ctx_init_ok = 0;
-static sigjmp_buf init_jmp;
-static sigjmp_buf ctx_jmp;
-
-static void segv_handler_init(int sig) { (void)sig; fprintf(stderr, "[!] init crashed, skipping platform init\n"); siglongjmp(init_jmp, 1); }
-static void segv_handler_ctx(int sig) { (void)sig; fprintf(stderr, "[!] init_ctx crashed, skipping context init\n"); siglongjmp(ctx_jmp, 1); }
-
-#ifndef MyRelease
-int32_t CURLOPT_SSL_VERIFYPEER = 64;
-int32_t CURLOPT_SSL_VERIFYHOST = 81;
-int32_t CURLOPT_PINNEDPUBLICKEY = 10230;
-
-/* Optional debug hooks via subhook, compiled only if HAVE_SUBHOOK is defined. */
-#ifdef HAVE_SUBHOOK
-subhook_t curl_hook;
-
-void curl_easy_setopt_hook(void *curl, int32_t option, ...) {
-    va_list args;
-    va_start(args, option);
-    void* param = va_arg(args, void*);
-
-    subhook_remove(curl_hook);
-
-    if (option == CURLOPT_SSL_VERIFYPEER || 
-        option == CURLOPT_SSL_VERIFYHOST || 
-        option == CURLOPT_PINNEDPUBLICKEY) {
-        curl_easy_setopt(curl, option, 0L);
-        printf("[+] hooked curl_easy_setopt %d\n", option);
-    } else {
-        curl_easy_setopt(curl, option, param);
-    }
-
-    va_end(args);
-    subhook_install(curl_hook);
-}
-
-int android_log_print_hook(int prio, const char *tag, const char *fmt, ...) {
-    char log_buffer[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(log_buffer, sizeof(log_buffer), fmt, args);
-    va_end(args);
-    printf("[%s] %s\n", tag, log_buffer);
-    return 0;
-}
-
-int android_log_write_hook(int prio, const char *tag, const char *text) {
-    printf("[%s] %s\n", tag, text);
-    return 0;
-}
-#endif /* HAVE_SUBHOOK */
-
-void DumpHex(const void* data, size_t size) {
-	char ascii[17];
-	size_t i, j;
-	ascii[16] = '\0';
-	for (i = 0; i < size; ++i) {
-		printf("%02X ", ((unsigned char*)data)[i]);
-		if (((unsigned char*)data)[i] >= ' ' && ((unsigned char*)data)[i] <= '~') {
-			ascii[i % 16] = ((unsigned char*)data)[i];
-		} else {
-			ascii[i % 16] = '.';
-		}
-		if ((i+1) % 8 == 0 || i+1 == size) {
-			printf(" ");
-			if ((i+1) % 16 == 0) {
-				printf("|  %s \n", ascii);
-			} else if (i+1 == size) {
-				ascii[(i+1) % 16] = '\0';
-				if ((i+1) % 16 <= 8) {
-					printf(" ");
-				}
-				for (j = (i+1) % 16; j < 16; ++j) {
-					printf("   ");
-				}
-				printf("|  %s \n", ascii);
-			}
-		}
-	}
-}
-#endif
+// Global state declared earlier
 
 int file_exists(char *filename) {
   struct stat buffer;   
@@ -181,33 +111,6 @@ char *strcat_b(char *dest, char* src) {
     strcat(result, src);
 
     return result;
-}
-
-int split_string_safe(const char *str, const char *delim, char **components, 
-                      int max_components, char **out_copy_to_free) 
-{
-    *out_copy_to_free = NULL;
-
-    char *copy = strdup(str);
-    if (copy == NULL) {
-        return -1; 
-    }
-
-    *out_copy_to_free = copy;
-
-    int count = 0;
-    char *saveptr;
-    char *token;
-
-    token = strtok_r(copy, delim, &saveptr);
-
-    while (token != NULL && count < max_components) {
-        components[count] = token;
-        count++;
-        token = strtok_r(NULL, delim, &saveptr);
-    }
-
-    return count;
 }
 
 static void dialogHandler(long j, struct shared_ptr *protoDialogPtr,
@@ -264,12 +167,42 @@ static void credentialHandler(struct shared_ptr *credReqHandler,
             credReqHandler->obj)),
         need2FA ? "true" : "false");
 
-    int passLen = strlen(amPassword);
+    size_t passLen = amPassword ? strlen(amPassword) : 0;
 
     if (need2FA) {
-        printf("2FA code: ");
-        fflush(stdout);
-        scanf("%6s", amPassword + passLen);
+        char code_buf[16] = {0};
+        FILE *in = stdin;
+        if (!in || !isatty(fileno(in))) {
+            in = fopen("/dev/tty", "r");
+        }
+        fprintf(stderr, "2FA code: ");
+        fflush(stderr);
+        if (in && fgets(code_buf, sizeof(code_buf), in) != NULL) {
+            size_t n = strcspn(code_buf, "\r\n");
+            code_buf[n] = '\0';
+            if (strlen(code_buf) > 6) {
+                code_buf[6] = '\0';
+            }
+            size_t codeLen = strlen(code_buf);
+            if (codeLen == 0) {
+                fprintf(stderr, "[!] Empty 2FA code.\n");
+                exit(EXIT_FAILURE);
+            }
+            char *combined = (char *)malloc(passLen + codeLen + 1);
+            if (!combined) {
+                perror("malloc");
+                exit(EXIT_FAILURE);
+            }
+            if (amPassword && passLen > 0) memcpy(combined, amPassword, passLen);
+            memcpy(combined + passLen, code_buf, codeLen);
+            combined[passLen + codeLen] = '\0';
+            amPassword = combined;
+            if (in != stdin) fclose(in);
+        } else {
+            fprintf(stderr, "[!] Failed to read 2FA code from input.\n");
+            if (in && in != stdin) fclose(in);
+            exit(EXIT_FAILURE);
+        }
     }
 
     uint8_t *const ptr = malloc(80);
@@ -318,7 +251,7 @@ static inline void init() {
     // for (int i = 0; i < 16; ++i) {
     //     android_id[i] = "0123456789abcdef"[rand() % 16];
     // }
-    union std_string conf1 = new_std_string(device_infos[8] ? device_infos[8] : "");
+    union std_string conf1 = new_std_string(android_id);
     union std_string conf2 = new_std_string("");
     _ZN14FootHillConfig6configERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE(
         &conf1);
@@ -330,81 +263,31 @@ static inline void init() {
     //     foothill, &root, &natLib);
     // _ZN8FootHill24defaultContextIdentifierEv(foothill);
 
-    _ZN17storeservicescore10DeviceGUID8instanceEv(&GUID);
+    _ZN17storeservicescore10DeviceGUID8instanceEvASM(&GUID);
 
     static uint8_t ret[88];
     static unsigned int conf3 = 29;
     static uint8_t conf4 = 1;
-    _ZN17storeservicescore10DeviceGUID9configureERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_RKjRKb(
+    _ZN17storeservicescore10DeviceGUID9configureERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_RKjRKbASM(
         &ret, GUID.obj, &conf1, &conf2, &conf3, &conf4);
 }
 
 static inline struct shared_ptr init_ctx() {
     fprintf(stderr, "[+] initializing ctx...\n");
-    union std_string strBuf =
-        new_std_string(strcat_b(args_info.base_dir_arg, "/mpl_db"));
 
-    struct shared_ptr reqCtx;
-    _ZNSt6__ndk110shared_ptrIN17storeservicescore14RequestContextEE11make_sharedIJRNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEEEES3_DpOT_(
-        &reqCtx, &strBuf);
+    struct shared_ptr *reqCtx = newRequestContext(strcat_b(args_info.base_dir_arg, "/mpl_db"));
+    struct shared_ptr *reqCtxCfg = getRequestContextConfig();
 
-    static uint8_t ptr[480];
-    *(void **)(ptr) =
-        &_ZTVNSt6__ndk120__shared_ptr_emplaceIN17storeservicescore20RequestContextConfigENS_9allocatorIS2_EEEE +
-        2;
-    struct shared_ptr reqCtxCfg = {.obj = ptr + 32, .ctrl_blk = ptr};
+    prepareRequestContextConfig(reqCtxCfg);
+    configureRequestContext(reqCtx);
 
-    _ZN17storeservicescore20RequestContextConfigC2Ev(reqCtxCfg.obj);
-	// _ZN17storeservicescore20RequestContextConfig9setCPFlagEb(reqCtx.obj, 1);
-    _ZN17storeservicescore20RequestContextConfig20setBaseDirectoryPathERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[0]);
-    _ZN17storeservicescore20RequestContextConfig19setClientIdentifierERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[1]);
-    _ZN17storeservicescore20RequestContextConfig20setVersionIdentifierERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[2]);
-    _ZN17storeservicescore20RequestContextConfig21setPlatformIdentifierERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[3]);
-    _ZN17storeservicescore20RequestContextConfig17setProductVersionERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[4]);
-    _ZN17storeservicescore20RequestContextConfig14setDeviceModelERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[5]);
-    _ZN17storeservicescore20RequestContextConfig15setBuildVersionERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[6]);
-    _ZN17storeservicescore20RequestContextConfig19setLocaleIdentifierERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-    strBuf = new_std_string(device_infos[7]);
-    _ZN17storeservicescore20RequestContextConfig21setLanguageIdentifierERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtxCfg.obj, &strBuf);
-
-    _ZN21RequestContextManager9configureERKNSt6__ndk110shared_ptrIN17storeservicescore14RequestContextEEE(
-        &reqCtx);
     static uint8_t buf[88];
-    _ZN17storeservicescore14RequestContext4initERKNSt6__ndk110shared_ptrINS_20RequestContextConfigEEE(
-        &buf, reqCtx.obj, &reqCtxCfg);
-    strBuf = new_std_string(args_info.base_dir_arg);
-    _ZN17storeservicescore14RequestContext24setFairPlayDirectoryPathERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
-        reqCtx.obj, &strBuf);
+    initRequestContext(buf, reqCtx, reqCtxCfg);
+    setFairPlayDirectoryPath(reqCtx, args_info.base_dir_arg);
+    initPresentationInterface(&apInf, &dialogHandler, &credentialHandler);
+    setPresentationInterface(reqCtx, &apInf);
 
-    _ZNSt6__ndk110shared_ptrIN20androidstoreservices28AndroidPresentationInterfaceEE11make_sharedIJEEES3_DpOT_(
-        &apInf);
-
-    _ZN20androidstoreservices28AndroidPresentationInterface16setDialogHandlerEPFvlNSt6__ndk110shared_ptrIN17storeservicescore14ProtocolDialogEEENS2_INS_36AndroidProtocolDialogResponseHandlerEEEE(
-        apInf.obj, &dialogHandler);
-
-    _ZN20androidstoreservices28AndroidPresentationInterface21setCredentialsHandlerEPFvNSt6__ndk110shared_ptrIN17storeservicescore18CredentialsRequestEEENS2_INS_33AndroidCredentialsResponseHandlerEEEE(
-        apInf.obj, &credentialHandler);
-
-    _ZN17storeservicescore14RequestContext24setPresentationInterfaceERKNSt6__ndk110shared_ptrINS_21PresentationInterfaceEEE(
-        reqCtx.obj, &apInf);
-
-    return reqCtx;
+    return *reqCtx;
 }
 
 extern void *endLeaseCallback;
@@ -412,22 +295,14 @@ extern void *pbErrCallback;
 
 inline static uint8_t login(struct shared_ptr reqCtx) {
     fprintf(stderr, "[+] logging in...\n");
-    char *path_sf = strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID");
-    if (path_sf) {
-        if (file_exists(path_sf)) {
-            remove(path_sf);
-        }
-        free(path_sf);
+    if (file_exists(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"))) {
+        remove(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"));
     }
-    char *path_mt = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
-    if (path_mt) {
-        if (file_exists(path_mt)) {
-            remove(path_mt);
-        }
-        free(path_mt);
+    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
+        remove(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"));
     }
     struct shared_ptr flow;
-    _ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_(
+    _ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_ASM(
         &flow, &reqCtx);
     _ZN17storeservicescore16AuthenticateFlow3runEv(flow.obj);
     struct shared_ptr *resp =
@@ -474,45 +349,20 @@ static inline void writefull(const int connfd, void *const buf,
 }
 
 static void *FHinstance = NULL;
-static _Atomic(void*) preshareCtx = NULL;
+static void *preshareCtx = NULL;
 static pthread_mutex_t preshare_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static inline void lease_refresh_automatically_wrapped(uint8_t *autom) {
-    pthread_mutex_lock(&lease_mutex);
-    _ZN22SVPlaybackLeaseManager25refreshLeaseAutomaticallyERKb(leaseMgr, autom);
-    pthread_mutex_unlock(&lease_mutex);
-}
-
-static inline void lease_request_wrapped(uint8_t *autom) {
-    pthread_mutex_lock(&lease_mutex);
-    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, autom);
-    pthread_mutex_unlock(&lease_mutex);
-}
-
-static void handle_sig(int sig) { (void)sig; shutdown_flag = 1; }
-
-// Allow external components (e.g., C++ callbacks) to trigger graceful shutdown
-void request_shutdown(void) {
-    shutdown_flag = 1;
-    if (listen_fd_dec != -1) {
-        shutdown(listen_fd_dec, SHUT_RDWR);
-    }
-    if (listen_fd_m3u8 != -1) {
-        shutdown(listen_fd_m3u8, SHUT_RDWR);
-    }
-    if (g_pool) {
-        thread_pool_shutdown(g_pool);
-    }
-}
 
 inline static void *getKdContext(const char *const adam,
                                  const char *const uri) {
     uint8_t isPreshare = (strcmp("0", adam) == 0);
     if (isPreshare) {
-        void *cached = atomic_load(&preshareCtx);
-        if (cached != NULL) {
+        pthread_mutex_lock(&preshare_mutex);
+        if (preshareCtx != NULL) {
+            void *cached = preshareCtx;
+            pthread_mutex_unlock(&preshare_mutex);
             return cached;
         }
+        pthread_mutex_unlock(&preshare_mutex);
     }
     fprintf(stderr, "[.] adamId: %s, uri: %s\n", adam, uri);
 
@@ -524,10 +374,10 @@ inline static void *getKdContext(const char *const adam,
     union std_string serverUri = new_std_string(
         "https://play.itunes.apple.com/WebObjects/MZPlay.woa/music/fps");
     union std_string protocolType = new_std_string("simplified");
-    union std_string fpsCert = new_std_string(fairplayCert);
+    union std_string fpsCert = new_std_string(fairplay_cert);
 
     struct shared_ptr persistK = {.obj = NULL};
-    _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_(
+    _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_ASM(
         &persistK, FHinstance, &defaultId, &defaultId, &keyUri, &keyFormat,
         &keyFormatVer, &serverUri, &protocolType, &fpsCert);
 
@@ -535,7 +385,7 @@ inline static void *getKdContext(const char *const adam,
         return NULL;
 
     struct shared_ptr SVFootHillPContext;
-    _ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKb(
+    _ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKbASM(
         &SVFootHillPContext, FHinstance, persistK.obj);
 
     if (SVFootHillPContext.obj == NULL)
@@ -545,19 +395,10 @@ inline static void *getKdContext(const char *const adam,
         *_ZNK18SVFootHillPContext9kdContextEv(SVFootHillPContext.obj);
     if (kdContext != NULL && isPreshare) {
         pthread_mutex_lock(&preshare_mutex);
-        atomic_store(&preshareCtx, kdContext);
+        preshareCtx = kdContext;
         pthread_mutex_unlock(&preshare_mutex);
     }
     return kdContext;
-}
-
-void refresh_decrypt_ctx() {
-    uint8_t autom = 1;
-    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
-    _ZN21SVFootHillSessionCtrl16resetAllContextsEv(FHinstance);
-    preshareCtx = NULL;
-    preshareCtx = getKdContext("0", "skd://itunes.apple.com/P000000000/s1/e1");
-    printf("[!] refreshed context\n");
 }
 
 void handle(const int connfd) {
@@ -618,22 +459,23 @@ extern uint8_t handle_cpp(int);
 void handle_m3u8(const int connfd);
 
 typedef struct { int fd; } decrypt_conn_args;
-static void *decrypt_conn(void *arg) {
+static void decrypt_task(void *arg) {
     decrypt_conn_args *a = (decrypt_conn_args *)arg;
     int cfd = a->fd;
     free(a);
     if (!handle_cpp(cfd)) {
         uint8_t autom = 1;
-        lease_request_wrapped(&autom);
+        pthread_mutex_lock(&lease_mutex);
+        _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+        pthread_mutex_unlock(&lease_mutex);
     }
     if (close(cfd) == -1) {
         perror("close");
     }
-    return NULL;
 }
 
 typedef struct { int fd; } m3u8_conn_args;
-static void *m3u8_conn(void *arg) {
+static void m3u8_task(void *arg) {
     m3u8_conn_args *a = (m3u8_conn_args *)arg;
     int cfd = a->fd;
     free(a);
@@ -641,36 +483,27 @@ static void *m3u8_conn(void *arg) {
     if (close(cfd) == -1) {
         perror("close");
     }
-    return NULL;
 }
-
-static inline void setup_conn_opts(int fd) {
-    struct timeval tv; tv.tv_sec = 30; tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-static void job_decrypt(void *arg) { (void)decrypt_conn(arg); }
-static void job_m3u8(void *arg) { (void)m3u8_conn(arg); }
 
 inline static int new_socket() {
-    listen_fd_dec = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
-    if (listen_fd_dec == -1) {
+    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (fd == -1) {
         perror("socket");
         return EXIT_FAILURE;
     }
+    decrypt_listen_fd = fd;
     const int optval = 1;
-    setsockopt(listen_fd_dec, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
     static struct sockaddr_in serv_addr = {.sin_family = AF_INET};
     inet_pton(AF_INET, args_info.host_arg, &serv_addr.sin_addr);
     serv_addr.sin_port = htons(args_info.decrypt_port_arg);
-    if (bind(listen_fd_dec, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
+    if (bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
         perror("bind");
         return EXIT_FAILURE;
     }
 
-    if (listen(listen_fd_dec, 128) == -1) {
+    if (listen(fd, 5) == -1) {
         perror("listen");
         return EXIT_FAILURE;
     }
@@ -680,17 +513,16 @@ inline static int new_socket() {
 
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
-    while (!shutdown_flag) {
-        const int connfd = accept4_compat(listen_fd_dec, (struct sockaddr *)&peer_addr,
+    while (!atomic_load(&shutdown_requested)) {
+        const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
+            if (atomic_load(&shutdown_requested)) break;
             if (is_transient_accept_errno(errno))
                 continue;
             perror("accept");
-            return EXIT_FAILURE;
+            break;
         }
-
-        setup_conn_opts(connfd);
         decrypt_conn_args *args = (decrypt_conn_args *)malloc(sizeof(decrypt_conn_args));
         if (args == NULL) {
             perror("malloc");
@@ -698,17 +530,25 @@ inline static int new_socket() {
             continue;
         }
         args->fd = connfd;
-        if (!thread_pool_enqueue(g_pool, job_decrypt, (void *)args)) {
-            free(args);
+        int rc = thread_pool_submit(g_pool, decrypt_task, (void *)args);
+        if (rc != 0) {
+            // fallback: handle synchronously
             if (!handle_cpp(connfd)) {
                 uint8_t autom = 1;
-                lease_request_wrapped(&autom);
+                pthread_mutex_lock(&lease_mutex);
+                _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+                pthread_mutex_unlock(&lease_mutex);
             }
             if (close(connfd) == -1) {
                 perror("close");
             }
+            free(args);
         }
     }
+    if (close(fd) == -1) {
+        perror("close");
+    }
+    decrypt_listen_fd = -1;
     return EXIT_SUCCESS;
 }
 
@@ -718,9 +558,11 @@ const char* get_m3u8_method_play(uint8_t leaseMgr[16], unsigned long adam) {
     struct std_vector HLSParam = new_std_vector(&HLS);
     static uint8_t z0 = 0;
     struct shared_ptr ptr_result;
-    _ZN22SVPlaybackLeaseManager12requestAssetERKmRKNSt6__ndk16vectorINS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS7_IS9_EEEERKb(
+    pthread_mutex_lock(&lease_mutex);
+    _ZN22SVPlaybackLeaseManager12requestAssetERKmRKNSt6__ndk16vectorINS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS7_IS9_EEEERKbASM(
         &ptr_result, leaseMgr, &adam, &HLSParam, &z0
     );
+    pthread_mutex_unlock(&lease_mutex);
     
     if (ptr_result.obj == NULL) {
         return NULL;
@@ -738,7 +580,7 @@ const char* get_m3u8_method_play(uint8_t leaseMgr[16], unsigned long adam) {
         }
 
         void *playbackObj = playbackAsset->obj;
-        _ZNK17storeservicescore13PlaybackAsset9URLStringEv(m3u8, playbackObj);
+        _ZNK17storeservicescore13PlaybackAsset9URLStringEvASM(m3u8, playbackObj);
 
         if (m3u8 == NULL || std_string_data(m3u8) == NULL) {
             free(m3u8);
@@ -768,11 +610,10 @@ void handle_m3u8(const int connfd) {
         if (adamSize <= 0) {
             return;
         }
-        char adam[adamSize + 1];
-        if (!readfull(connfd, adam, adamSize)) {
-            return;
+        char adam[adamSize];
+        for (int i=0; i<adamSize; i=i+1) {
+            readfull(connfd, &adam[i], sizeof(uint8_t));
         }
-        adam[adamSize] = '\0';
         char *ptr;
         unsigned long adamID = strtoul(adam, &ptr, 10);
         const char *m3u8 = get_m3u8_method_play(leaseMgr, adamID);
@@ -794,22 +635,21 @@ void handle_m3u8(const int connfd) {
 }
 
 static inline void *new_socket_m3u8(void *args) {
-    (void)args;
-    listen_fd_m3u8 = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
-    if (listen_fd_m3u8 == -1) {
+    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (fd == -1) {
         perror("socket");
     }
     const int optval = 1;
-    setsockopt(listen_fd_m3u8, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
     static struct sockaddr_in serv_addr = {.sin_family = AF_INET};
     inet_pton(AF_INET, args_info.host_arg, &serv_addr.sin_addr);
     serv_addr.sin_port = htons(args_info.m3u8_port_arg);
-    if (bind(listen_fd_m3u8, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
+    if (bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
         perror("bind");
     }
 
-    if (listen(listen_fd_m3u8, 128) == -1) {
+    if (listen(fd, 5) == -1) {
         perror("listen");
     }
 
@@ -818,18 +658,17 @@ static inline void *new_socket_m3u8(void *args) {
 
     static struct sockaddr_in peer_addr;
     static socklen_t peer_addr_size = sizeof(peer_addr);
-    while (!shutdown_flag) {
-        const int connfd = accept4_compat(listen_fd_m3u8, (struct sockaddr *)&peer_addr,
+    while (!atomic_load(&shutdown_requested)) {
+        const int connfd = accept4_compat(fd, (struct sockaddr *)&peer_addr,
                                    &peer_addr_size, SOCK_CLOEXEC);
         if (connfd == -1) {
+            if (atomic_load(&shutdown_requested)) break;
             if (is_transient_accept_errno(errno))
                 continue;
             perror("accept");
-            continue;
-            
+            break;
         }
-
-        setup_conn_opts(connfd);
+        // submit to thread pool
         m3u8_conn_args *args_m = (m3u8_conn_args *)malloc(sizeof(m3u8_conn_args));
         if (args_m == NULL) {
             perror("malloc");
@@ -837,52 +676,46 @@ static inline void *new_socket_m3u8(void *args) {
             continue;
         }
         args_m->fd = connfd;
-        if (!thread_pool_enqueue(g_pool, job_m3u8, (void *)args_m)) {
-            free(args_m);
+        int rc = thread_pool_submit(g_pool, m3u8_task, (void *)args_m);
+        if (rc != 0) {
+            // fallback: handle synchronously
             handle_m3u8(connfd);
             if (close(connfd) == -1) {
                 perror("close");
             }
+            free(args_m);
         }
     }
-    return NULL;
+    if (close(fd) == -1) {
+        perror("close");
+    }
+    m3u8_listen_fd = -1;
 }
 
 char* get_account_storefront_id(struct shared_ptr reqCtx) {
     union std_string *region = malloc(sizeof(union std_string));
     struct shared_ptr urlbag = {.obj = 0x0, .ctrl_blk = 0x0};
-    _ZNK17storeservicescore14RequestContext20storeFrontIdentifierERKNSt6__ndk110shared_ptrINS_6URLBagEEE(region, reqCtx.obj, &urlbag);
+    _ZNK17storeservicescore14RequestContext20storeFrontIdentifierERKNSt6__ndk110shared_ptrINS_6URLBagEEEASM(region, reqCtx.obj, &urlbag);
     const char *region_str = std_string_data(region);
-    char *result = NULL;
     if (region_str) {
-        result = strdup(region_str);
-    }
-    free(region);
-    return result;
+        char *result = strdup(region_str); 
+        free(region);
+        return result;
+    } 
+    return NULL;
 }
 
 void write_storefront_id(struct shared_ptr reqCtx) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s", args_info.base_dir_arg, "STOREFRONT_ID");
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        perror("fopen");
-        return;
-    }
+    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"), "w");
     char *storefront_id = get_account_storefront_id(reqCtx);
-    if (storefront_id) {
-        printf("[+] StoreFront ID: %s\n", storefront_id);
-        fprintf(fp, "%s", storefront_id);
-        free(storefront_id);
-    } else {
-        fprintf(stderr, "[!] StoreFront ID unavailable\n");
-    }
+    printf("[+] StoreFront ID: %s\n", storefront_id);
+    fprintf(fp, "%s", get_account_storefront_id(reqCtx));
     fclose(fp);
 }
 
 char *get_guid() {
     char *ret[2];
-    _ZN17storeservicescore10DeviceGUID4guidEv(ret, GUID.obj);
+    _ZN17storeservicescore10DeviceGUID4guidEvASM(ret, GUID.obj);
     char *guid = _ZNK13mediaplatform4Data5bytesEv(ret[0]);
     return guid;
 }
@@ -930,8 +763,7 @@ char *get_music_user_token(char *guid, char *authToken, struct shared_ptr reqCtx
     _ZN17storeservicescore10URLRequest3runEv(urlRequest);
     struct shared_ptr *err = _ZNK17storeservicescore10URLRequest5errorEv(urlRequest);
     if (err->obj != NULL) {
-        fprintf(stderr, "[!] HTTP error creating music user token\n");
-        return NULL;
+        return "";
     }
     struct shared_ptr *urlResp = _ZNK17storeservicescore10URLRequest8responseEv(urlRequest);
     struct shared_ptr *resp = _ZNK17storeservicescore11URLResponse18underlyingResponseEv(urlResp->obj);
@@ -940,24 +772,9 @@ char *get_music_user_token(char *guid, char *authToken, struct shared_ptr reqCtx
     void* data_ptr = *data_ptr_location;
     char *respBody = _ZNK13mediaplatform4Data5bytesEv(data_ptr);
     cJSON *json = cJSON_Parse(respBody);
-    if (!json) {
-        fprintf(stderr, "[!] JSON parse failed for music token\n");
-        return NULL;
-    }
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "music_token");
-    if (!token_obj) {
-        cJSON_Delete(json);
-        fprintf(stderr, "[!] JSON missing 'music_token'\n");
-        return NULL;
-    }
     char *token = cJSON_GetStringValue(token_obj);
-    if (!token) {
-        cJSON_Delete(json);
-        fprintf(stderr, "[!] 'music_token' is not a string\n");
-        return NULL;
-    }
     char *result = strdup(token);
-    cJSON_Delete(json);
     return result;
 }
 
@@ -982,8 +799,7 @@ char* get_dev_token(struct shared_ptr reqCtx) {
     _ZN17storeservicescore10URLRequest3runEv(urlRequest);
     struct shared_ptr *err = _ZNK17storeservicescore10URLRequest5errorEv(urlRequest);
     if (err->obj != NULL) {
-        fprintf(stderr, "[!] HTTP error getting dev token\n");
-        return NULL;
+        return "";
     }
     struct shared_ptr *urlResp = _ZNK17storeservicescore10URLRequest8responseEv(urlRequest);
     struct shared_ptr *resp = _ZNK17storeservicescore11URLResponse18underlyingResponseEv(urlResp->obj);
@@ -992,169 +808,90 @@ char* get_dev_token(struct shared_ptr reqCtx) {
     void* data_ptr = *data_ptr_location;
     char *respBody = _ZNK13mediaplatform4Data5bytesEv(data_ptr);
     cJSON *json = cJSON_Parse(respBody);
-    if (!json) {
-        fprintf(stderr, "[!] JSON parse failed for dev token\n");
-        return NULL;
-    }
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "token");
-    if (!token_obj) {
-        cJSON_Delete(json);
-        fprintf(stderr, "[!] JSON missing 'token'\n");
-        return NULL;
-    }
     char *token = cJSON_GetStringValue(token_obj);
-    if (!token) {
-        cJSON_Delete(json);
-        fprintf(stderr, "[!] 'token' is not a string\n");
-        return NULL;
-    }
     char *result = strdup(token);
-    cJSON_Delete(json);
     return result;
 }
 
 void write_music_token(struct shared_ptr reqCtx) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s", args_info.base_dir_arg, "MUSIC_TOKEN");
     int token_file_available = 0;
-    if (file_exists(path)) {
-        FILE *rfp = fopen(path, "r");
-        if (rfp != NULL) {
-            if (fseek(rfp, 0, SEEK_END) == 0) {
-                long size = ftell(rfp);
-                if (size > 0) token_file_available = 1;
+    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
+        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
+        if (NULL != fp) {
+            fseek (fp, 0, SEEK_END);
+            long size = ftell(fp);
+
+            if (0 != size) {
+                token_file_available = 1;
             }
-            fclose(rfp);
         }
     }
     if (token_file_available) {
-        char token[256] = {0};
-        FILE *rfp = fopen(path, "r");
-        if (rfp) {
-            fgets(token, sizeof(token), rfp);
-            fclose(rfp);
-        }
+        char token[256];
+        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
+        fgets(token, sizeof(token), fp);
         printf("[+] Music-Token: %.14s...\n", token);
         return;
     }
-    FILE *wfp = fopen(path, "w");
-    if (!wfp) {
-        perror("fopen");
-        return;
-    }
+    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "w");
     char *guid = get_guid();
     char *dev_token = get_dev_token(reqCtx);
     char *token = get_music_user_token(guid, dev_token, reqCtx);
-    if (token) {
-        printf("[+] Music-Token: %.14s...\n", token);
-        fprintf(wfp, "%s", token);
-    } else {
-        fprintf(stderr, "[!] Music-Token unavailable\n");
-    }
-    fclose(wfp);
+    printf("[+] Music-Token: %.14s...\n", token);
+    fprintf(fp, "%s", token);
+    fclose(fp);
 }
 
 int main(int argc, char *argv[]) {
     cmdline_parser(argc, argv, &args_info);
-    char *copy_that_needs_to_be_freed = NULL;
-    int di_count = 0;
-    if (args_info.device_info_arg && *args_info.device_info_arg) {
-        di_count = split_string_safe(args_info.device_info_arg, "/", device_infos, 9, &copy_that_needs_to_be_freed);
-    }
-    // 补齐缺失的 device_infos 段，避免后续对 device_infos[8] 的空指针解引用
-    for (int i = di_count; i < 9; ++i) {
-        device_infos[i] = "";
-    }
 
-    #if !defined(MyRelease) && defined(HAVE_SUBHOOK)
-    subhook_install(subhook_new(_ZN13mediaplatform26DebugLogEnabledForPriorityENS_11LogPriorityE, allDebug, SUBHOOK_64BIT_OFFSET));
-    curl_hook = subhook_new(curl_easy_setopt, curl_easy_setopt_hook, SUBHOOK_64BIT_OFFSET);
-    subhook_install(curl_hook);
-    subhook_install(subhook_new(__android_log_print, android_log_print_hook, SUBHOOK_64BIT_OFFSET));
-    subhook_install(subhook_new(__android_log_write, android_log_write_hook, SUBHOOK_64BIT_OFFSET));
-    #endif
+    // Install signal handlers for graceful shutdown
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
-    // Protect init() from crashing due to external platform dependencies
-    struct sigaction old_segv, old_bus, old_abrt, new_segv; memset(&new_segv, 0, sizeof(new_segv));
-    new_segv.sa_handler = segv_handler_init; sigemptyset(&new_segv.sa_mask);
-    sigaction(SIGSEGV, &new_segv, &old_segv);
-    sigaction(SIGBUS,  &new_segv, &old_bus);
-    sigaction(SIGABRT, &new_segv, &old_abrt);
-    if (sigsetjmp(init_jmp, 1) == 0) {
-        init();
-        platform_init_ok = 1;
-    } else {
-        platform_init_ok = 0;
-    }
-    sigaction(SIGSEGV, &old_segv, NULL);
-    sigaction(SIGBUS,  &old_bus,  NULL);
-    sigaction(SIGABRT, &old_abrt, NULL);
-    // Protect init_ctx() from crashing due to external dependencies
-    struct shared_ptr ctx_default = {.obj = NULL, .ctrl_blk = NULL};
-    struct shared_ptr ctx;
-    memset((void*)&ctx, 0, sizeof(ctx));
-    memset((void*)&ctx_default, 0, sizeof(ctx_default));
-    memset(&new_segv, 0, sizeof(new_segv));
-    struct sigaction old_segv2, old_bus2, old_abrt2; memset(&new_segv, 0, sizeof(new_segv));
-    new_segv.sa_handler = segv_handler_ctx; sigemptyset(&new_segv.sa_mask);
-    sigaction(SIGSEGV, &new_segv, &old_segv2);
-    sigaction(SIGBUS,  &new_segv, &old_bus2);
-    sigaction(SIGABRT, &new_segv, &old_abrt2);
-    if (sigsetjmp(ctx_jmp, 1) == 0) {
-        ctx = init_ctx();
-        ctx_init_ok = 1;
-    } else {
-        ctx = ctx_default;
-        ctx_init_ok = 0;
-    }
-    sigaction(SIGSEGV, &old_segv2, NULL);
-    sigaction(SIGBUS,  &old_bus2,  NULL);
-    sigaction(SIGABRT, &old_abrt2, NULL);
+    init();
+    const struct shared_ptr ctx = init_ctx();
     if (args_info.login_given) {
         amUsername = strtok(args_info.login_arg, ":");
         amPassword = strtok(NULL, ":");
     }
     if (args_info.login_given && !login(ctx)) {
-        fprintf(stderr, "[!] login failed, continuing without account-bound features\n");
+        fprintf(stderr, "[!] login failed\n");
+        return EXIT_FAILURE;
     }
-    // 使用更大的缓冲区承载 SVPlaybackLeaseManager，避免构造函数越界写入
-    if (platform_init_ok) {
-        _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
-            leaseMgr, &endLeaseCallback, &pbErrCallback);
-    } else {
-        fprintf(stderr, "[!] Skipping LeaseManager init due to platform init failure\n");
-    }
+    _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
+        leaseMgr, &endLeaseCallback, &pbErrCallback);
     uint8_t autom = 1;
-    if (platform_init_ok) {
-        lease_refresh_automatically_wrapped(&autom);
-        lease_request_wrapped(&autom);
-        FHinstance = _ZN21SVFootHillSessionCtrl8instanceEv();
+    _ZN22SVPlaybackLeaseManager25refreshLeaseAutomaticallyERKb(leaseMgr,
+                                                               &autom);
+    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+    FHinstance = getFootHillInstance();
+
+    write_storefront_id(ctx);
+    write_music_token(ctx);
+
+    // Create thread pool: use number of online CPUs (fallback to 8)
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    size_t nthreads = (size_t)((nproc > 0 && nproc <= 64) ? nproc : 8);
+    g_pool = thread_pool_create(nthreads);
+    if (!g_pool) {
+        fprintf(stderr, "[!] failed to create thread pool\n");
+        return EXIT_FAILURE;
     }
-
-    if (platform_init_ok && ctx_init_ok) {
-        write_storefront_id(ctx);
-        write_music_token(ctx);
-    } else {
-        fprintf(stderr, "[!] Skipping ID/Token generation due to init failure (platform/ctx)\n");
-    }
-
-    struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = handle_sig; sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
-
-    int nthreads = 8; int maxq = 256;
-    g_pool = thread_pool_create(nthreads, maxq);
 
     pthread_t m3u8_thread;
-    if (platform_init_ok) {
-        pthread_create(&m3u8_thread, NULL, &new_socket_m3u8, NULL);
-    } else {
-        fprintf(stderr, "[!] Skipping m3u8 thread due to platform init failure\n");
-    }
+    pthread_create(&m3u8_thread, NULL, &new_socket_m3u8, NULL);
+    pthread_detach(m3u8_thread);
 
-    int rc = new_socket();
-    shutdown_flag = 1;
-    thread_pool_shutdown(g_pool);
-    if (platform_init_ok) {
-        pthread_join(m3u8_thread, NULL);
-    }
-    return rc;
+    int ret = new_socket();
+    thread_pool_shutdown(g_pool, 1);
+    thread_pool_destroy(g_pool);
+    g_pool = NULL;
+    return ret;
 }

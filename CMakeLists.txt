@@ -22,13 +22,17 @@ set(HANDLE_SOURCE main.cpp)
 set(CJSON_SOURCE cjson/cjson.c)
 set(MAIN_SOURCE main.c)
 set(WRAPPER_SOURCE wrapper.c)
-set(THREAD_POOL_SOURCE thread_pool.c)
 
 add_library(cmdline_object OBJECT ${CMDLINE_SOURCE})
 add_library(handle_object OBJECT ${HANDLE_SOURCE})
 add_library(cjson_object OBJECT ${CJSON_SOURCE})
+add_library(thread_pool_object OBJECT thread_pool.c)
 
-add_executable(main ${MAIN_SOURCE} ${THREAD_POOL_SOURCE} $<TARGET_OBJECTS:cmdline_object> $<TARGET_OBJECTS:handle_object> $<TARGET_OBJECTS:cjson_object>)
+add_executable(main ${MAIN_SOURCE} \
+    $<TARGET_OBJECTS:cmdline_object> \
+    $<TARGET_OBJECTS:handle_object> \
+    $<TARGET_OBJECTS:cjson_object> \
+    $<TARGET_OBJECTS:thread_pool_object>)
 
 set_target_properties(main PROPERTIES 
     COMPILE_DEFINITIONS "MyRelease"
@@ -40,9 +44,6 @@ find_library(STORESERVICESCORE_LIB storeservicescore PATHS ${CMAKE_SOURCE_DIR}/r
 find_library(MEDIAPLATFORM_LIB mediaplatform PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 find_library(CXX_SHARED_LIB c++_shared PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 
-# Ensure Threads::Threads target is available for linking
-find_package(Threads REQUIRED)
-
 # Link libraries
 target_link_libraries(main
     ${CXX_SHARED_LIB}
@@ -52,45 +53,16 @@ target_link_libraries(main
     Threads::Threads
 )
 
-get_target_property(MAIN_COMPILE_DEFINITIONS main COMPILE_DEFINITIONS)
-if(NOT "MyRelease" IN_LIST MAIN_COMPILE_DEFINITIONS)
-    target_link_libraries(main
-        ${LOG_SHARED_LIB}
-        ${CURL_SHARED_LIB}
-    )
-    set(CMAKE_C_FLAGS "-Werror -g")
-    set(CMAKE_CXX_FLAGS "-Werror -g")
-else()
-    set(CMAKE_C_FLAGS "-Wall -Werror")
-    set(CMAKE_CXX_FLAGS "-Wall -Werror")
-endif()
-
 link_directories(${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
-
-# Select wrapper build command per host platform (keep lines above intact)
-if(APPLE)
-    # Build macOS arm64 wrapper using Apple clang
-    set(WRAPPER_BUILD_EXE clang)
-    set(WRAPPER_BUILD_ARGS -O3 -Wall -arch arm64 -o wrapper ${WRAPPER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmdline.c)
-elseif(UNIX)
-    # Build Linux aarch64 wrapper using cross compiler
-    find_program(AARCH64_GCC aarch64-linux-gnu-gcc)
-    if(NOT AARCH64_GCC)
-        message(FATAL_ERROR "aarch64-linux-gnu-gcc not found. Please install gcc-aarch64-linux-gnu.")
-    endif()
-    set(WRAPPER_BUILD_EXE ${AARCH64_GCC})
-    set(WRAPPER_BUILD_ARGS -O3 -Wall -o wrapper ${WRAPPER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmdline.c)
-else()
-    message(FATAL_ERROR "Unsupported host platform for wrapper build")
-endif()
 
 ExternalProject_Add(
     wrapper
     PREFIX ${CMAKE_BINARY_DIR}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${WRAPPER_BUILD_EXE} ${WRAPPER_BUILD_ARGS}
+    BUILD_COMMAND aarch64-linux-gnu-gcc -o wrapper ${WRAPPER_SOURCE}
     BUILD_IN_SOURCE 1
     INSTALL_COMMAND ""
     DEPENDS main
 )
+find_package(Threads REQUIRED)
