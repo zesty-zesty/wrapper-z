@@ -2,10 +2,13 @@
 
 #include <errno.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#if defined(__linux__)
 #include <sys/sysmacros.h>
+#endif
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -79,12 +82,14 @@ int main(int argc, char *argv[], char *envp[]) {
     chmod("/system/bin/linker64", 0755);
     chmod("/system/bin/main", 0755);
 
+    #if defined(__linux__)
     if (has_cap_sys_admin()) {
         if (unshare(CLONE_NEWPID)) {
             perror("unshare");
             return 1;
         }
     }
+    #endif
 
     child_proc = fork();
     if (child_proc == -1) {
@@ -99,7 +104,9 @@ int main(int argc, char *argv[], char *envp[]) {
 
     // Child process logic
     mkdir(args_info.base_dir_arg, 0777);
-    mkdir(strcat(args_info.base_dir_arg, "/mpl_db"), 0777);
+    char mpl_path[512];
+    snprintf(mpl_path, sizeof(mpl_path), "%s/%s", args_info.base_dir_arg, "mpl_db");
+    mkdir(mpl_path, 0777);
     execve("/system/bin/main", argv, envp);
     perror("execve");
     return 1;
