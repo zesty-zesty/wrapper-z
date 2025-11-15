@@ -810,7 +810,7 @@ int main(int argc, char *argv[]) {
     write_storefront_id(ctx);
     write_music_token(ctx);
 
-    thread_pool_t *pool = thread_pool_create(4);
+        thread_pool_t *pool = thread_pool_create(4, 64);
 
     pthread_t m3u8_thread;
     pthread_create(&m3u8_thread, NULL, new_socket_m3u8, pool);

@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(wrapper)
+find_package(Threads REQUIRED)
 include(ExternalProject)
 
 set(CMAKE_C_STANDARD 99)
@@ -44,7 +45,7 @@ find_library(CXX_SHARED_LIB c++_shared PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/l
 
 # Link libraries
 target_link_libraries(main
-    pthread
+    Threads::Threads
     ${CXX_SHARED_LIB}
     ${ANDROIDAPPMUSIC_LIB}
     ${STORESERVICESCORE_LIB}
