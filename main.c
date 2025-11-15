@@ -412,11 +412,19 @@ extern void *pbErrCallback;
 
 inline static uint8_t login(struct shared_ptr reqCtx) {
     fprintf(stderr, "[+] logging in...\n");
-    if (file_exists(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"))) {
-        remove(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"));
+    char *path_sf = strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID");
+    if (path_sf) {
+        if (file_exists(path_sf)) {
+            remove(path_sf);
+        }
+        free(path_sf);
     }
-    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
-        remove(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"));
+    char *path_mt = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
+    if (path_mt) {
+        if (file_exists(path_mt)) {
+            remove(path_mt);
+        }
+        free(path_mt);
     }
     struct shared_ptr flow;
     _ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_(
@@ -482,6 +490,20 @@ static inline void lease_request_wrapped(uint8_t *autom) {
 }
 
 static void handle_sig(int sig) { (void)sig; shutdown_flag = 1; }
+
+// Allow external components (e.g., C++ callbacks) to trigger graceful shutdown
+void request_shutdown(void) {
+    shutdown_flag = 1;
+    if (listen_fd_dec != -1) {
+        shutdown(listen_fd_dec, SHUT_RDWR);
+    }
+    if (listen_fd_m3u8 != -1) {
+        shutdown(listen_fd_m3u8, SHUT_RDWR);
+    }
+    if (g_pool) {
+        thread_pool_shutdown(g_pool);
+    }
+}
 
 inline static void *getKdContext(const char *const adam,
                                  const char *const uri) {
@@ -746,10 +768,11 @@ void handle_m3u8(const int connfd) {
         if (adamSize <= 0) {
             return;
         }
-        char adam[adamSize];
-        for (int i=0; i<adamSize; i=i+1) {
-            readfull(connfd, &adam[i], sizeof(uint8_t));
+        char adam[adamSize + 1];
+        if (!readfull(connfd, adam, adamSize)) {
+            return;
         }
+        adam[adamSize] = '\0';
         char *ptr;
         unsigned long adamID = strtoul(adam, &ptr, 10);
         const char *m3u8 = get_m3u8_method_play(leaseMgr, adamID);
@@ -830,12 +853,12 @@ char* get_account_storefront_id(struct shared_ptr reqCtx) {
     struct shared_ptr urlbag = {.obj = 0x0, .ctrl_blk = 0x0};
     _ZNK17storeservicescore14RequestContext20storeFrontIdentifierERKNSt6__ndk110shared_ptrINS_6URLBagEEE(region, reqCtx.obj, &urlbag);
     const char *region_str = std_string_data(region);
+    char *result = NULL;
     if (region_str) {
-        char *result = strdup(region_str); 
-        free(region);
-        return result;
-    } 
-    return NULL;
+        result = strdup(region_str);
+    }
+    free(region);
+    return result;
 }
 
 void write_storefront_id(struct shared_ptr reqCtx) {
@@ -907,7 +930,8 @@ char *get_music_user_token(char *guid, char *authToken, struct shared_ptr reqCtx
     _ZN17storeservicescore10URLRequest3runEv(urlRequest);
     struct shared_ptr *err = _ZNK17storeservicescore10URLRequest5errorEv(urlRequest);
     if (err->obj != NULL) {
-        return "";
+        fprintf(stderr, "[!] HTTP error creating music user token\n");
+        return NULL;
     }
     struct shared_ptr *urlResp = _ZNK17storeservicescore10URLRequest8responseEv(urlRequest);
     struct shared_ptr *resp = _ZNK17storeservicescore11URLResponse18underlyingResponseEv(urlResp->obj);
@@ -916,9 +940,24 @@ char *get_music_user_token(char *guid, char *authToken, struct shared_ptr reqCtx
     void* data_ptr = *data_ptr_location;
     char *respBody = _ZNK13mediaplatform4Data5bytesEv(data_ptr);
     cJSON *json = cJSON_Parse(respBody);
+    if (!json) {
+        fprintf(stderr, "[!] JSON parse failed for music token\n");
+        return NULL;
+    }
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "music_token");
+    if (!token_obj) {
+        cJSON_Delete(json);
+        fprintf(stderr, "[!] JSON missing 'music_token'\n");
+        return NULL;
+    }
     char *token = cJSON_GetStringValue(token_obj);
+    if (!token) {
+        cJSON_Delete(json);
+        fprintf(stderr, "[!] 'music_token' is not a string\n");
+        return NULL;
+    }
     char *result = strdup(token);
+    cJSON_Delete(json);
     return result;
 }
 
@@ -943,7 +982,8 @@ char* get_dev_token(struct shared_ptr reqCtx) {
     _ZN17storeservicescore10URLRequest3runEv(urlRequest);
     struct shared_ptr *err = _ZNK17storeservicescore10URLRequest5errorEv(urlRequest);
     if (err->obj != NULL) {
-        return "";
+        fprintf(stderr, "[!] HTTP error getting dev token\n");
+        return NULL;
     }
     struct shared_ptr *urlResp = _ZNK17storeservicescore10URLRequest8responseEv(urlRequest);
     struct shared_ptr *resp = _ZNK17storeservicescore11URLResponse18underlyingResponseEv(urlResp->obj);
@@ -952,9 +992,24 @@ char* get_dev_token(struct shared_ptr reqCtx) {
     void* data_ptr = *data_ptr_location;
     char *respBody = _ZNK13mediaplatform4Data5bytesEv(data_ptr);
     cJSON *json = cJSON_Parse(respBody);
+    if (!json) {
+        fprintf(stderr, "[!] JSON parse failed for dev token\n");
+        return NULL;
+    }
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "token");
+    if (!token_obj) {
+        cJSON_Delete(json);
+        fprintf(stderr, "[!] JSON missing 'token'\n");
+        return NULL;
+    }
     char *token = cJSON_GetStringValue(token_obj);
+    if (!token) {
+        cJSON_Delete(json);
+        fprintf(stderr, "[!] 'token' is not a string\n");
+        return NULL;
+    }
     char *result = strdup(token);
+    cJSON_Delete(json);
     return result;
 }
 
