@@ -255,10 +255,12 @@ static inline void init() {
     // for (int i = 0; i < 16; ++i) {
     //     android_id[i] = "0123456789abcdef"[rand() % 16];
     // }
+    fprintf(stderr, "[.] init: configuring FootHill...\n");
     union std_string conf1 = new_std_string(android_id);
     union std_string conf2 = new_std_string("");
     _ZN14FootHillConfig6configERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE(
         &conf1);
+    fprintf(stderr, "[.] init: FootHill configured\n");
 
     // union std_string root = new_std_string("/");
     // union std_string natLib = new_std_string("/system/lib64/");
@@ -267,13 +269,17 @@ static inline void init() {
     //     foothill, &root, &natLib);
     // _ZN8FootHill24defaultContextIdentifierEv(foothill);
 
+    fprintf(stderr, "[.] init: acquiring DeviceGUID instance...\n");
     _ZN17storeservicescore10DeviceGUID8instanceEvASM(&GUID);
+    fprintf(stderr, "[.] init: DeviceGUID acquired\n");
 
     static uint8_t ret[88];
     static unsigned int conf3 = 29;
     static uint8_t conf4 = 1;
+    fprintf(stderr, "[.] init: configuring DeviceGUID...\n");
     _ZN17storeservicescore10DeviceGUID9configureERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_RKjRKbASM(
         &ret, GUID.obj, &conf1, &conf2, &conf3, &conf4);
+    fprintf(stderr, "[+] init: DeviceGUID configured\n");
 }
 
 static inline struct shared_ptr init_ctx() {
@@ -801,7 +807,8 @@ char *get_music_user_token(char *guid, char *authToken, struct shared_ptr reqCtx
     cJSON *json = cJSON_Parse(respBody);
     cJSON *token_obj = cJSON_GetObjectItemCaseSensitive(json, "music_token");
     char *token = cJSON_GetStringValue(token_obj);
-    char *result = strdup(token);
+    char *result = token ? strdup(token) : NULL;
+    if (json) cJSON_Delete(json);
     return result;
 }
 
@@ -883,8 +890,9 @@ void write_music_token(struct shared_ptr reqCtx) {
     fprintf(fp, "%s", token);
     fclose(fp);
     if (token_path) free(token_path);
-    if (dev_token) free(dev_token);
+    // token is strdup'ed in get_music_user_token, safe to free
     if (token) free(token);
+    if (dev_token) free(dev_token);
 }
 
 int main(int argc, char *argv[]) {
