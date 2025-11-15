@@ -47,10 +47,15 @@ set_target_properties(main PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/rootfs/system/bin"
 )
 
-find_library(ANDROIDAPPMUSIC_LIB androidappmusic PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
-find_library(STORESERVICESCORE_LIB storeservicescore PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
-find_library(MEDIAPLATFORM_LIB mediaplatform PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
-find_library(CXX_SHARED_LIB c++_shared PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
+set(LIB_SEARCH_PATH ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
+find_library(ANDROIDAPPMUSIC_LIB androidappmusic HINTS ${LIB_SEARCH_PATH})
+find_library(STORESERVICESCORE_LIB storeservicescore HINTS ${LIB_SEARCH_PATH})
+find_library(MEDIAPLATFORM_LIB mediaplatform HINTS ${LIB_SEARCH_PATH})
+find_library(CXX_SHARED_LIB c++_shared HINTS ${LIB_SEARCH_PATH})
+
+if (NOT CXX_SHARED_LIB OR NOT ANDROIDAPPMUSIC_LIB OR NOT STORESERVICESCORE_LIB OR NOT MEDIAPLATFORM_LIB)
+    message(FATAL_ERROR "One or more required libraries not found. Please check ${LIB_SEARCH_PATH}.")
+endif()
 
 # Link libraries
 find_package(Threads REQUIRED)
@@ -61,16 +66,16 @@ target_link_libraries(main
     ${STORESERVICESCORE_LIB}
     ${MEDIAPLATFORM_LIB}
     Threads::Threads
+    android
+    log
 )
-
-link_directories(${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 
 ExternalProject_Add(
     wrapper
     PREFIX ${CMAKE_BINARY_DIR}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND aarch64-linux-gnu-gcc -o wrapper ${WRAPPER_SOURCE}
+    BUILD_COMMAND gcc -o wrapper ${WRAPPER_SOURCE} -D__linux__
     BUILD_IN_SOURCE 1
     INSTALL_COMMAND ""
     DEPENDS main

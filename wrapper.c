@@ -72,7 +72,18 @@ int main(int argc, char *argv[], char *envp[]) {
 
     if (child_proc > 0) {
         close(STDOUT_FILENO);
-        wait(NULL);  // Parent waits for the child process to terminate
+        int status;
+        wait(&status);  // Parent waits for the child process to terminate
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            if (exit_status != 0) {
+                fprintf(stderr, "Child exited with status %d\n", exit_status);
+            }
+            return exit_status;
+        } else if (WIFSIGNALED(status)) {
+            fprintf(stderr, "Child terminated by signal %d\n", WTERMSIG(status));
+            return 1;
+        }
         return 0;
     }
 
@@ -103,6 +114,8 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     // Hint linker search path just in case
     setenv("LD_LIBRARY_PATH", "/system/lib64", 1);
+    setenv("ANDROID_ROOT", "/system", 1);
+    setenv("ANDROID_DATA", "/data", 1);
     execve("/system/bin/main", argv, envp);
     perror("execve");
     return 1;

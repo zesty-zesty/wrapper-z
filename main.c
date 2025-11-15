@@ -375,11 +375,12 @@ inline static void *getKdContext(const char *const adam,
         if (preshareCtx != NULL) {
             void *cached = preshareCtx;
             pthread_mutex_unlock(&preshare_mutex);
+            fprintf(stderr, "[+] getKdContext: returning cached preshare context\n");
             return cached;
         }
         pthread_mutex_unlock(&preshare_mutex);
     }
-    fprintf(stderr, "[.] adamId: %s, uri: %s\n", adam, uri);
+    fprintf(stderr, "[.] getKdContext: adamId: %s, uri: %s\n", adam, uri);
 
     union std_string defaultId = new_std_string(adam);
     union std_string keyUri = new_std_string(uri);
@@ -392,26 +393,37 @@ inline static void *getKdContext(const char *const adam,
     union std_string fpsCert = new_std_string(fairplay_cert);
 
     struct shared_ptr persistK = {.obj = NULL};
+    fprintf(stderr, "[.] getKdContext: calling getPersistentKey...\n");
     _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_ASM(
         &persistK, FHinstance, &defaultId, &defaultId, &keyUri, &keyFormat,
         &keyFormatVer, &serverUri, &protocolType, &fpsCert);
 
-    if (persistK.obj == NULL)
+    if (persistK.obj == NULL) {
+        fprintf(stderr, "[!] getKdContext: getPersistentKey failed, persistK.obj is NULL\n");
         return NULL;
+    }
+    fprintf(stderr, "[.] getKdContext: getPersistentKey successful, persistK.obj: %p\n", persistK.obj);
 
     struct shared_ptr SVFootHillPContext;
+    fprintf(stderr, "[.] getKdContext: calling decryptContext...\n");
     _ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKbASM(
         &SVFootHillPContext, FHinstance, persistK.obj);
 
-    if (SVFootHillPContext.obj == NULL)
+    if (SVFootHillPContext.obj == NULL) {
+        fprintf(stderr, "[!] getKdContext: decryptContext failed, SVFootHillPContext.obj is NULL\n");
         return NULL;
+    }
+    fprintf(stderr, "[.] getKdContext: decryptContext successful, SVFootHillPContext.obj: %p\n", SVFootHillPContext.obj);
 
     void *kdContext =
         *_ZNK18SVFootHillPContext9kdContextEv(SVFootHillPContext.obj);
+    fprintf(stderr, "[.] getKdContext: kdContext from SVFootHillPContext: %p\n", kdContext);
+
     if (kdContext != NULL && isPreshare) {
         pthread_mutex_lock(&preshare_mutex);
         preshareCtx = kdContext;
         pthread_mutex_unlock(&preshare_mutex);
+        fprintf(stderr, "[+] getKdContext: cached preshare context\n");
     }
     return kdContext;
 }
