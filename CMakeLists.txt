@@ -40,6 +40,9 @@ find_library(STORESERVICESCORE_LIB storeservicescore PATHS ${CMAKE_SOURCE_DIR}/r
 find_library(MEDIAPLATFORM_LIB mediaplatform PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 find_library(CXX_SHARED_LIB c++_shared PATHS ${CMAKE_SOURCE_DIR}/rootfs/system/lib64)
 
+# Ensure Threads::Threads target is available for linking
+find_package(Threads REQUIRED)
+
 # Link libraries
 target_link_libraries(main
     ${CXX_SHARED_LIB}
